@@ -5,108 +5,108 @@ import time
 from datetime import datetime
 
 # --- 頁面配置 ---
-st.set_page_config(page_title="SOL Alpha Hunter", layout="wide")
+st.set_page_config(page_title="SOL 真實鏈上監控", layout="wide")
 
-# 自定義 CSS 讓表格看起來更專業，並隱藏不必要的元件
+# 注入自定義 CSS (優化手機顯示與一鍵複製體驗)
 st.markdown("""
     <style>
     .stDataFrame { width: 100%; }
-    .copy-btn { background-color: #00ffa3; color: black; border-radius: 5px; padding: 2px 5px; cursor: pointer; }
+    [data-testid="stMetricValue"] { font-size: 24px; color: #00ffa3; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 側邊欄設定 (你的 3 項條件) ---
+# --- 側邊欄設定 (連動你的 3 項條件) ---
 with st.sidebar:
-    st.header("⚙️ 策略參數")
-    MCAP_LIMIT = st.number_input("1. 市值上限 (USD)", value=50000)
-    BUY_LIMIT_SOL = st.number_input("1. 買入觸發 (SOL)", value=10.0)
-    VOL_1M_LIMIT = st.number_input("2. 1分鐘爆量 (SOL)", value=30.0)
-    OLD_DAYS = st.number_input("3. 老幣定義 (天)", value=3)
+    st.header("🎯 篩選策略設定")
+    target_mcap = st.number_input("1. 市值上限 (USD)", value=50000, help="低於此市值才顯示")
+    min_buy_vol = st.number_input("1. 買入門檻 (USD)", value=1000, help="單筆或短時買入額")
+    velocity_5m = st.number_input("2. 5分鐘成交量門檻", value=5000)
+    old_token_days = st.number_input("3. 老幣定義 (天數)", value=3)
 
-# --- 核心數據抓取 (對接實時 API) ---
-def fetch_data():
-    # 這裡模擬從 Solana RPC 或 DexScreener 獲取的真實數據流
-    # 實際上你會對接到 Pump.fun / Meteora 的實時 API
-    mock_data = [
-        {
-            "Time": datetime.now().strftime("%H:%M:%S"),
-            "Platform": "Pump.fun",
-            "Symbol": "PEPE_SOL",
-            "CA": "6EF8rrecth7DY54Z4863WE7498369262624262426242", # 範例 CA
-            "MCap": 12500,
-            "Vol_1m": 45.2,
-            "Age": 0.1,
-            "Dex": "https://dexscreener.com/solana/..."
-        },
-        {
-            "Time": datetime.now().strftime("%H:%M:%S"),
-            "Platform": "Meteora",
-            "Symbol": "WIF_MOON",
-            "CA": "EKpQ9A7P5m24Pmc2iSptYp6kSxyFwtT1V299V75Ypump", # 範例 CA
-            "MCap": 48000,
-            "Vol_1m": 12.0,
-            "Age": 5.0,
-            "Dex": "https://dexscreener.com/solana/..."
-        }
-    ]
-    
-    processed = []
-    for d in mock_data:
-        # 你的 3 項篩選邏輯
-        tag = ""
-        if d['MCap'] < MCAP_LIMIT and d['Vol_1m'] > BUY_LIMIT_SOL: tag = "🔥 低市爆買"
-        elif d['Vol_1m'] > VOL_1M_LIMIT: tag = "⚡ 爆量噴發"
-        elif d['Age'] >= OLD_DAYS and d['Vol_1m'] > (BUY_LIMIT_SOL * 2): tag = "💎 老幣回血"
+# --- 核心：獲取真實鏈上數據 ---
+def get_realtime_sol_data():
+    """調用 DexScreener API 獲取 Solana 最新代幣對"""
+    try:
+        # 抓取 Solana 鏈上最新變動的 30 個交易對
+        url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        # 這裡改用另一個更強大的 API：最新 Boosted 交易對 (包含 Pump.fun 畢業後的幣)
+        search_url = "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"
         
-        if tag:
-            processed.append({
-                "時間": d['Time'],
-                "平台": d['Platform'],
-                "代幣": d['Symbol'],
-                "CA (點擊複製)": d['CA'], # 這是我們要處理的欄位
-                "市值": f"${d['MCap']:,}",
-                "1min": f"{d['Vol_1m']} SOL",
-                "天數": f"{d['Age']}d",
-                "狀態": tag,
-                "查看": d['Dex']
-            })
-    return processed
+        response = requests.get(search_url, timeout=10)
+        if response.status_code != 200: return []
+        
+        pairs = response.json().get('pairs', [])
+        now = datetime.now()
+        matches = []
 
-# --- 主畫面 ---
-st.title("🛡️ Solana 實時監測：Alpha Hunter")
+        for p in pairs:
+            # 過濾非 Solana 鏈數據
+            if p.get('chainId') != 'solana': continue
+            
+            # 提取關鍵數據
+            mcap = p.get('fdv', 0)  # 完全稀釋估值 (即市值)
+            vol_5m = p.get('volume', {}).get('m5', 0)
+            vol_1h = p.get('volume', {}).get('h1', 0)
+            created_at = datetime.fromtimestamp(p.get('pairCreatedAt', 0) / 1000)
+            age_days = (now - created_at).days
+            ca = p.get('baseToken', {}).get('address', '')
+            platform = p.get('dexId', 'Unknown').capitalize()
+            symbol = p.get('baseToken', {}).get('symbol', 'Unknown')
 
-if "data_log" not in st.session_state:
-    st.session_state.data_log = []
+            # --- 你的 3 項硬核條件判斷 ---
+            tag = ""
+            # 1. 市值設定值以下 且 買入金額達標 (這裡用 5m 成交量作為參考)
+            if mcap <= target_mcap and vol_5m >= min_buy_vol:
+                tag = "🔥 低市爆買"
+            # 2. 5分鐘內成交量暴增
+            elif vol_5m >= velocity_5m:
+                tag = "⚡ 爆量噴發"
+            # 3. 超過設定天數的老幣 突然爆量
+            elif age_days >= old_token_days and vol_5m > (velocity_5m * 0.5):
+                tag = "💎 老幣翻紅"
 
-# 更新數據
-new_entries = fetch_data()
-for ne in new_entries:
-    if ne not in st.session_state.data_log:
-        st.session_state.data_log.insert(0, ne)
+            if tag:
+                matches.append({
+                    "時間": now.strftime("%H:%M:%S"),
+                    "平台": platform,
+                    "代幣": symbol,
+                    "CA (一鍵複製)": ca,
+                    "市值": f"${mcap:,.0f}",
+                    "5m成交額": f"${vol_5m:,.0f}",
+                    "天數": f"{age_days}天",
+                    "狀態": tag,
+                    "圖表": f"https://dexscreener.com/solana/{ca}"
+                })
+        return matches
+    except Exception as e:
+        return [{"狀態": "Error", "代幣": str(e)}]
 
-# 保持長度
-st.session_state.data_log = st.session_state.data_log[:20]
+# --- UI 介面 ---
+st.title("🛡️ Solana Real-time Alpha Hunter")
+st.caption("數據來源：DexScreener API (涵蓋 Pump.fun, Raydium, Meteora)")
 
-if st.session_state.data_log:
-    df = pd.DataFrame(st.session_state.data_log)
+# 自動刷新容器
+placeholder = st.empty()
+
+# 為了讓它在 Streamlit 上像真正的監控器，使用無限循環
+while True:
+    real_data = get_realtime_sol_data()
     
-    # 💡 關鍵：使用 Streamlit 的 column_config.TextColumn 搭配複製功能
-    st.dataframe(
-        df,
-        column_config={
-            "CA (點擊複製)": st.column_config.TextColumn(
-                "CA (點擊複製)",
-                help="點擊右側圖標即可複製合約地址",
-                width="medium",
-            ),
-            "查看": st.column_config.LinkColumn("圖表連結")
-        },
-        use_container_width=True,
-        hide_index=True
-    )
-else:
-    st.info("⌛ 等待信號中... 自動刷新中")
-
-# 自動刷新
-time.sleep(5)
-st.rerun()
+    with placeholder.container():
+        if real_data:
+            df = pd.DataFrame(real_data)
+            # 使用自定義顯示
+            st.dataframe(
+                df,
+                column_config={
+                    "CA (一鍵複製)": st.column_config.TextColumn("CA (點擊右側複製)", width="medium"),
+                    "圖表": st.column_config.LinkColumn("查看線圖")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("⌛ 目前池子中無符合條件的目標，持續掃描中...")
+            
+    time.sleep(12) # API 限制建議每 10-15 秒請求一次
+    st.rerun()
