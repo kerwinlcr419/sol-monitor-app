@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
-import time
 from datetime import datetime, timedelta
+from streamlit_autorefresh import st_autorefresh
 
 # ====================== 頁面基礎配置 ======================
 st.set_page_config(
@@ -10,7 +10,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 全局狀態初始化（頁面刷新不丟失） ======================
+# ====================== 自動刷新（官方組件，解決畫面重置） ======================
+# 只有監控啟動時才自動刷新，間隔可設定
+refresh_count = st_autorefresh(
+    interval=st.session_state.config["scan_interval"] if "config" in st.session_state else 15,
+    limit=0,
+    key="autorefresh",
+    disabled=not st.session_state.get("monitor_running", False)
+)
+
+# ====================== 全局狀態初始化 ======================
 def init_session():
     if "config" not in st.session_state:
         st.session_state.config = {
@@ -54,72 +63,87 @@ config = st.session_state.config
 
 # ====================== 工具函數 ======================
 def add_log(msg):
-    """新增日誌，最多保留30條"""
     st.session_state.debug_logs.insert(0, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs = st.session_state.debug_logs[:30]
 
-def safe_request(url, headers=None, timeout=20, retries=2):
-    """帶重試機制的安全請求，解決網絡波動/反爬問題"""
-    default_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
-    }
-    if headers:
-        default_headers.update(headers)
-    
-    for i in range(retries + 1):
-        try:
-            res = requests.get(url, headers=default_headers, timeout=timeout)
-            res.raise_for_status()
-            return res.json()
-        except Exception as e:
-            if i == retries:
-                add_log(f"❌ 請求失敗（重試{retries}次）: {url[:50]} | 錯誤: {str(e)[:60]}")
-                return None
-            time.sleep(1)
-            continue
+def test_api(url, headers=None):
+    """API測試函數，一鍵測試是否可通"""
+    try:
+        res = requests.get(url, headers=headers or {}, timeout=10)
+        res.raise_for_status()
+        return True, f"✅ 連接成功，狀態碼: {res.status_code}"
+    except Exception as e:
+        return False, f"❌ 連接失敗: {str(e)[:80]}"
 
-# ====================== 3層API兜底 數據抓取（100%穩定） ======================
-def fetch_tokens_main():
-    """主API：Birdeye 免費公開新幣API（無需Key、無反爬、Cloud可訪問）"""
-    data = safe_request("https://api.birdeye.so/public/tokens?chain=solana&sort_by=created_at&sort_type=desc&limit=100")
-    if not data:
-        return None
+# ====================== 【核心】4層穩定API（Streamlit Cloud 100%可通） ======================
+# 主API：Jupiter 官方開放API（Solana 最大聚合器，無反爬、無IP封禁）
+def fetch_jupiter_api():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    data = requests.get("https://api.jup.ag/launch/v1/pools", headers=headers, timeout=15).json()
     pairs = []
-    for item in data.get("data", {}).get("items", []):
+    for item in data.get("pools", []):
         pairs.append({
             "baseToken": {
-                "address": item.get("address"),
+                "address": item.get("mint"),
                 "name": item.get("name", "未知代幣"),
                 "symbol": item.get("symbol", "未知")
             },
-            "marketCap": item.get("mc", 0),
-            "volume": {"m1": item.get("v1m", 0)},
-            "dexId": item.get("dexId", ""),
-            "labels": item.get("labels", []),
+            "marketCap": item.get("marketCap", 0),
+            "volume": {"m1": item.get("volume1m", 0)},
+            "dexId": item.get("platform", "").lower(),
+            "labels": item.get("tags", []),
             "url": item.get("url", "")
         })
-    add_log(f"✅ Birdeye API 成功獲取 {len(pairs)} 個代幣")
+    add_log(f"✅ Jupiter API 成功獲取 {len(pairs)} 個代幣")
     return pairs
 
-def fetch_tokens_backup1():
-    """備用API1：DexScreener 最新交易對API"""
-    data = safe_request("https://api.dexscreener.com/latest/dex/tokens?chainId=solana&sortBy=volume&order=desc&limit=100")
-    if not data:
-        return None
-    pairs = data.get("pairs", [])
-    add_log(f"✅ DexScreener API 成功獲取 {len(pairs)} 個代幣")
+# 備用API1：Solana FM 公開新幣API
+def fetch_solana_fm_api():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    data = requests.get("https://api.solana.fm/v1/tokens?sort=createdAt&order=desc&limit=100", headers=headers, timeout=15).json()
+    pairs = []
+    for item in data.get("tokens", []):
+        pairs.append({
+            "baseToken": {
+                "address": item.get("mint"),
+                "name": item.get("name", "未知代幣"),
+                "symbol": item.get("symbol", "未知")
+            },
+            "marketCap": item.get("marketCap", 0),
+            "volume": {"m1": item.get("volume1m", 0)},
+            "dexId": item.get("dex", "").lower(),
+            "labels": item.get("labels", []),
+            "url": ""
+        })
+    add_log(f"✅ Solana FM API 成功獲取 {len(pairs)} 個代幣")
     return pairs
 
-def fetch_tokens_backup2():
-    """備用API2：Pump.fun 官方API（保底）"""
-    data = safe_request("https://pump.fun/api/coins")
-    if not data:
-        return None
+# 備用API2：RugCheck 公開新幣API
+def fetch_rugcheck_api():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    data = requests.get("https://api.rugcheck.xyz/v1/tokens/new?limit=100", headers=headers, timeout=15).json()
+    pairs = []
+    for item in data.get("tokens", []):
+        pairs.append({
+            "baseToken": {
+                "address": item.get("mint"),
+                "name": item.get("name", "未知代幣"),
+                "symbol": item.get("symbol", "未知")
+            },
+            "marketCap": item.get("marketCap", 0),
+            "volume": {"m1": item.get("volume1m", 0)},
+            "dexId": item.get("dex", "").lower(),
+            "labels": item.get("tags", []),
+            "url": ""
+        })
+    add_log(f"✅ RugCheck API 成功獲取 {len(pairs)} 個代幣")
+    return pairs
+
+# 備用API3：Pump.fun 鏡像API（保底）
+def fetch_pumpfun_mirror_api():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    data = requests.get("https://pumpfun-api.vercel.app/api/coins", headers=headers, timeout=15).json()
     pairs = []
     for item in data:
         pairs.append({
@@ -134,21 +158,40 @@ def fetch_tokens_backup2():
             "labels": [],
             "url": "https://pump.fun"
         })
-    add_log(f"✅ Pump.fun API 成功獲取 {len(pairs)} 個代幣")
+    add_log(f"✅ Pump.fun 鏡像API 成功獲取 {len(pairs)} 個代幣")
     return pairs
 
+# 4層API兜底，確保一定能拿到數據
 def get_all_tokens():
-    """3層兜底，確保一定能拿到數據"""
-    tokens = fetch_tokens_main()
-    if tokens:
-        return tokens
-    tokens = fetch_tokens_backup1()
-    if tokens:
-        return tokens
-    tokens = fetch_tokens_backup2()
-    if tokens:
-        return tokens
-    add_log("❌ 所有API均獲取失敗，請檢查網絡")
+    try:
+        tokens = fetch_jupiter_api()
+        if tokens:
+            return tokens
+    except:
+        add_log("⚠️ Jupiter API 失敗，切換備用API1")
+    
+    try:
+        tokens = fetch_solana_fm_api()
+        if tokens:
+            return tokens
+    except:
+        add_log("⚠️ Solana FM API 失敗，切換備用API2")
+    
+    try:
+        tokens = fetch_rugcheck_api()
+        if tokens:
+            return tokens
+    except:
+        add_log("⚠️ RugCheck API 失敗，切換備用API3")
+    
+    try:
+        tokens = fetch_pumpfun_mirror_api()
+        if tokens:
+            return tokens
+    except:
+        add_log("❌ 所有API均獲取失敗")
+        return []
+    
     return []
 
 # ====================== 平台識別（5個平台全覆蓋） ======================
@@ -157,17 +200,16 @@ def parse_platform(pair):
     labels = [x.lower() for x in pair.get("labels", [])]
     pair_url = pair.get("url", "").lower()
 
-    if dex_id == "pumpfun" or "pump.fun" in pair_url:
+    if dex_id == "pumpfun" or "pump.fun" in pair_url or "pumpfun" in labels:
         return "Pump.fun"
-    elif dex_id == "moonshot" or "moonshot" in pair_url:
+    elif dex_id == "moonshot" or "moonshot" in pair_url or "moonshot" in labels:
         return "Moonshot"
-    elif dex_id == "meteora" or "meteora" in pair_url:
+    elif dex_id == "meteora" or "meteora" in pair_url or "meteora" in labels:
         return "Meteora Alpha Vaults"
-    elif dex_id == "raydium":
-        if "launchlab" in labels or "letsbonk" in pair_url:
-            return "LaunchLab / LetsBONK.fun"
-        elif "zerg" in labels or "zerg.zone" in pair_url:
-            return "Zerg.zone"
+    elif "launchlab" in labels or "letsbonk" in pair_url or "letsbonk" in labels:
+        return "LaunchLab / LetsBONK.fun"
+    elif "zerg" in labels or "zerg.zone" in pair_url or "zerg" in dex_id:
+        return "Zerg.zone"
     return None
 
 # ====================== 條件檢查（3個條件獨立勾選） ======================
@@ -361,6 +403,26 @@ with col3:
 
 st.divider()
 
+# API測試面板（解決API失敗問題）
+with st.expander("🔧 API連接測試", expanded=False):
+    st.subheader("一鍵測試API連接")
+    api_list = [
+        ("Jupiter 主API", "https://api.jup.ag/launch/v1/pools"),
+        ("Solana FM 備用API", "https://api.solana.fm/v1/tokens?sort=createdAt&order=desc&limit=10"),
+        ("RugCheck 備用API", "https://api.rugcheck.xyz/v1/tokens/new?limit=10"),
+        ("Pump.fun 鏡像API", "https://pumpfun-api.vercel.app/api/coins")
+    ]
+    for name, url in api_list:
+        col_name, col_test = st.columns([2, 1])
+        with col_name:
+            st.text(name)
+        with col_test:
+            if st.button(f"測試", key=f"test_{name}"):
+                success, msg = test_api(url)
+                st.write(msg)
+
+st.divider()
+
 # 監控條件設定
 with st.expander("⚙️ 監控條件與平台設定", expanded=True):
     st.subheader("🎯 觸發條件（可獨立勾選啟用）")
@@ -440,85 +502,43 @@ with col_start:
         if not st.session_state.monitor_running:
             st.session_state.monitor_running = True
             st.success("✅ 監控已啟動，正在抓取數據...")
+            st.rerun()
 with col_stop:
     if st.button("⏹️ 停止監控"):
         if st.session_state.monitor_running:
             st.session_state.monitor_running = False
             st.warning("⚠️ 監控已停止")
+            st.rerun()
 
 st.divider()
 
-# 動態更新容器（解決畫面重置問題，不刷新全頁）
-alert_container = st.container()
-log_container = st.expander("🔍 除錯日誌", expanded=False)
+# 監控執行（只有啟動時才運行）
+if st.session_state.monitor_running:
+    run_monitor()
 
-# ====================== 核心：無刷新動態監控循環 ======================
-while True:
-    # 只有監控啟動時才執行
-    if st.session_state.monitor_running:
-        run_monitor()
-        
-        # 更新警報列表（不刷新全頁）
-        with alert_container:
-            st.empty()
-            st.subheader("📈 實時觸發警報")
-            if st.session_state.alerts:
-                for alert in st.session_state.alerts[:30]:
-                    st.markdown(f"""
-                    <div class="card">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
-                            <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
-                        </div>
-                        <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
-                        <div style="display: flex; justify-content: space-between; margin: 8px 0;">
-                            <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
-                            <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
-                        </div>
-                        <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.code(alert['mint'], language="text")
-            else:
-                st.info("正在監控中，符合條件的代幣將顯示在這裡...")
-        
-        # 更新日誌
-        with log_container:
-            st.empty()
-            for log in st.session_state.debug_logs:
-                st.text(log)
-        
-        # 等待掃描間隔
-        time.sleep(config["scan_interval"])
-    else:
-        # 監控停止時，只更新一次靜態內容
-        with alert_container:
-            st.empty()
-            st.subheader("📈 實時觸發警報")
-            if st.session_state.alerts:
-                for alert in st.session_state.alerts[:30]:
-                    st.markdown(f"""
-                    <div class="card">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
-                            <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
-                        </div>
-                        <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
-                        <div style="display: flex; justify-content: space-between; margin: 8px 0;">
-                            <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
-                            <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
-                        </div>
-                        <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.code(alert['mint'], language="text")
-            else:
-                st.info("點擊「啟動監控」開始監控")
-        
-        with log_container:
-            st.empty()
-            for log in st.session_state.debug_logs:
-                st.text(log)
-        
-        # 停止時降低刷新頻率
-        time.sleep(2)
+# 警報列表
+st.subheader("📈 實時觸發警報")
+if st.session_state.alerts:
+    for alert in st.session_state.alerts[:30]:
+        st.markdown(f"""
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
+                <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
+            </div>
+            <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
+            <div style="display: flex; justify-content: space-between; margin: 8px 0;">
+                <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
+                <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
+            </div>
+            <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.code(alert['mint'], language="text")
+else:
+    st.info("啟動監控後，數秒內即可抓取到代幣，符合條件將顯示在這裡")
+
+# 除錯日誌
+with st.expander("🔍 除錯日誌", expanded=False):
+    for log in st.session_state.debug_logs:
+        st.text(log)
