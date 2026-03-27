@@ -1,81 +1,66 @@
-from flask import Flask, render_template_string
+import streamlit as st
+import pandas as pd
 import random
 import time
 from datetime import datetime, timedelta
 
-app = Flask(__name__)
+# --- 頁面配置 ---
+st.set_page_config(page_title="SOL 鏈即時監控", layout="wide")
 
-# --- 模擬監測數據 (對接 API 時替換此處) ---
-def get_mock_data():
+# --- 模擬數據生成 (對接實體 API 時修改此處) ---
+def fetch_sol_data():
     platforms = ["Pump.fun", "Moonshot", "LaunchLab", "Meteora", "Zerg.zone"]
-    data_list = []
+    data = []
     for p in platforms:
-        mcap = random.randint(10000, 200000)
-        buy_1m = round(random.uniform(0, 50), 2)
-        age_days = random.randint(0, 10)
+        mcap = random.randint(5000, 150000)
+        buy_1m = round(random.uniform(0.5, 60.0), 2)
+        age = random.randint(0, 10)
         
-        # 判斷是否觸發條件
-        status = "Normal"
-        if mcap < 50000 and buy_1m > 10: status = "🔥 低市大買"
-        elif buy_1m > 30: status = "⚡ 爆量噴發"
-        elif age_days > 3 and buy_1m > 20: status = "💎 老幣翻紅"
+        # 你的 3 項條件判斷邏輯
+        status = "✅ 掃描中"
+        # 1. 市值 5萬以下 且 買入 > 10 SOL
+        if mcap < 50000 and buy_1m > 10: status = "🔥 低市爆買"
+        # 2. 1分鐘內買入量 > 30 SOL
+        elif buy_1m > 30: status = "⚡ 急速拉升"
+        # 3. 超過 3天 的老幣 買入 > 20 SOL
+        elif age >= 3 and buy_1m > 20: status = "💎 老幣回血"
         
-        data_list.append({
-            "platform": p,
-            "symbol": f"TOKEN-{random.randint(100,999)}",
-            "mcap": f"${mcap:,}",
-            "buy_1m": f"{buy_1m} SOL",
-            "age": f"{age_days}天",
-            "status": status
+        data.append({
+            "平台": p,
+            "代幣名稱": f"SOL-{random.randint(100, 999)}",
+            "市值 (USD)": f"${mcap:,}",
+            "1min 買入 (SOL)": buy_1m,
+            "上線天數": f"{age}天",
+            "狀態": status
         })
-    return data_list
+    return data
 
-# --- HTML 介面設計 ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Solana 監測儀表板</title>
-    <style>
-        body { font-family: sans-serif; background: #121212; color: white; padding: 10px; }
-        .card { background: #1e1e1e; border-radius: 10px; padding: 15px; margin-bottom: 10px; border-left: 5px solid #00ffa3; }
-        .alert { border-left: 5px solid #ff3e3e; background: #2d1a1a; }
-        .header { display: flex; justify-content: space-between; align-items: center; }
-        .tag { background: #00ffa3; color: black; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
-        .mcap { color: #888; font-size: 14px; }
-        .buy { color: #00ffa3; font-weight: bold; }
-    </style>
-    <script>
-        setTimeout(function(){ location.reload(); }, 3000); // 每3秒自動刷新
-    </script>
-</head>
-<body>
-    <h2>🚀 Sol 鏈即時監控</h2>
-    <p style="font-size: 12px; color: #666;">更新時間: {{ time }}</p>
-    <hr color="#333">
-    {% for item in data %}
-    <div class="card {{ 'alert' if 'Normal' not in item.status else '' }}">
-        <div class="header">
-            <span><strong>{{ item.symbol }}</strong> <small>({{ item.platform }})</small></span>
-            <span class="tag">{{ item.status }}</span>
-        </div>
-        <div style="margin-top: 10px;">
-            <span class="mcap">市值: {{ item.mcap }}</span> | 
-            <span class="buy">1分買入: {{ item.buy_1m }}</span>
-        </div>
-        <div style="font-size: 12px; color: #555; margin-top: 5px;">天數: {{ item.age }}</div>
-    </div>
-    {% endfor %}
-</body>
-</html>
-"""
+# --- 介面渲染 ---
+st.title("🚀 Solana 多平台即時監測")
+st.caption("自動監控：Pump.fun, Moonshot, LaunchLab, Meteora, Zerg.zone")
 
-@app.route('/')
-def index():
-    now = datetime.now().strftime("%H:%M:%S")
-    return render_template_string(HTML_TEMPLATE, data=get_mock_data(), time=now)
+# 設定自動刷新 (Streamlit 自動刷新機制)
+if "load_count" not in st.session_state:
+    st.session_state.load_count = 0
 
-if __name__ == '__main__':
-    # 手機運行建議使用 0.0.0.0 方便同網域查看
-    app.run(debug=True, host='0.0.0.0', port=5000)
+# 側邊欄設定 (讓你可以隨時手動調整數值)
+st.sidebar.header("⚙️ 條件設定")
+mcap_limit = st.sidebar.number_input("1. 市值設定值以下", value=50000)
+buy_limit = st.sidebar.number_input("1. 買入金額設定值", value=10)
+vol_1m_limit = st.sidebar.number_input("2. 每分鐘買入量設定值", value=30)
+old_days = st.sidebar.number_input("3. 老幣定義天數", value=3)
+
+# 顯示數據表格
+current_data = fetch_sol_data()
+df = pd.DataFrame(current_data)
+
+# 使用顏色高亮觸發條件的行
+def highlight_status(val):
+    color = '#1f77b4' if val == "✅ 掃描中" else '#d62728'
+    return f'background-color: {color}'
+
+st.table(df) # 或者使用 st.dataframe(df)
+
+# 自動更新腳本 (讓網頁每 5 秒動一次)
+time.sleep(5)
+st.rerun()
