@@ -1,104 +1,112 @@
 import streamlit as st
 import pandas as pd
-import asyncio
-import json
+import requests
 import time
 from datetime import datetime
 
-# --- 核心協議合約地址 (Professional Registry) ---
-PROTOCOL_IDS = {
-    "Pump.fun": "6EF8rrecth7DY54Z4863WE7498369262624262426242",
-    "Moonshot": "MSN1det57... (需替換完整地址)",
-    "LaunchLab": "LLab... (需替換完整地址)",
-    "Meteora_Vault": "Vaul6... (Alpha Vaults)",
-    "Zerg.zone": "Zerg... (需替換完整地址)"
-}
-
 # --- 頁面配置 ---
-st.set_page_config(page_title="SOL Protocol Alpha Hunter", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="SOL Alpha Hunter", layout="wide")
 
-# --- 專業級參數設定 ---
+# 自定義 CSS 讓表格看起來更專業，並隱藏不必要的元件
+st.markdown("""
+    <style>
+    .stDataFrame { width: 100%; }
+    .copy-btn { background-color: #00ffa3; color: black; border-radius: 5px; padding: 2px 5px; cursor: pointer; }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- 側邊欄設定 (你的 3 項條件) ---
 with st.sidebar:
-    st.header("🎯 策略參數 (Quant Settings)")
-    mcap_threshold = st.number_input("Entry MCap (USD) <", value=50000, step=5000)
-    min_buy_sol = st.number_input("Single Buy Threshold (SOL) >", value=10.0, format="%.1f")
-    velocity_threshold = st.number_input("1min Velocity (SOL) >", value=30.0)
-    dormant_days = st.slider("Dormant Days (Old Token)", 1, 30, 3)
-    surge_multiplier = st.slider("Surge Multiplier (Relative to Avg)", 1.5, 10.0, 3.0)
+    st.header("⚙️ 策略參數")
+    MCAP_LIMIT = st.number_input("1. 市值上限 (USD)", value=50000)
+    BUY_LIMIT_SOL = st.number_input("1. 買入觸發 (SOL)", value=10.0)
+    VOL_1M_LIMIT = st.number_input("2. 1分鐘爆量 (SOL)", value=30.0)
+    OLD_DAYS = st.number_input("3. 老幣定義 (天)", value=3)
 
-# --- 模擬即時流處理 (Mocking Stream for UI demo, Replace with WSS logic) ---
-def process_protocol_stream():
-    """
-    這部分在實戰中會連接 Helius Geyser 或 QuickNode WSS。
-    它解析每一筆 Transaction Log 中的 'Program Data'。
-    """
-    # 這裡演示的是經過解析後的數據結構
-    raw_events = [
-        {"platform": "Pump.fun", "mint": "Ag7...1f", "mcap": 12000, "buy_amount": 15.5, "age": 0.1},
-        {"platform": "Meteora", "mint": "De6...9z", "mcap": 450000, "buy_amount": 45.0, "age": 5.2},
-        {"platform": "Zerg.zone", "mint": "Z3r...x2", "mcap": 8000, "buy_amount": 2.1, "age": 0.5},
+# --- 核心數據抓取 (對接實時 API) ---
+def fetch_data():
+    # 這裡模擬從 Solana RPC 或 DexScreener 獲取的真實數據流
+    # 實際上你會對接到 Pump.fun / Meteora 的實時 API
+    mock_data = [
+        {
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "Platform": "Pump.fun",
+            "Symbol": "PEPE_SOL",
+            "CA": "6EF8rrecth7DY54Z4863WE7498369262624262426242", # 範例 CA
+            "MCap": 12500,
+            "Vol_1m": 45.2,
+            "Age": 0.1,
+            "Dex": "https://dexscreener.com/solana/..."
+        },
+        {
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "Platform": "Meteora",
+            "Symbol": "WIF_MOON",
+            "CA": "EKpQ9A7P5m24Pmc2iSptYp6kSxyFwtT1V299V75Ypump", # 範例 CA
+            "MCap": 48000,
+            "Vol_1m": 12.0,
+            "Age": 5.0,
+            "Dex": "https://dexscreener.com/solana/..."
+        }
     ]
-    return raw_events
-
-# --- 監控邏輯實作 ---
-def analyze_signal(event):
-    signals = []
     
-    # 條件 1: 低市值爆買 (Smart Money Entry)
-    if event['mcap'] < mcap_threshold and event['buy_amount'] >= min_buy_sol:
-        signals.append("🔥 SMART_ENTRY")
+    processed = []
+    for d in mock_data:
+        # 你的 3 項篩選邏輯
+        tag = ""
+        if d['MCap'] < MCAP_LIMIT and d['Vol_1m'] > BUY_LIMIT_SOL: tag = "🔥 低市爆買"
+        elif d['Vol_1m'] > VOL_1M_LIMIT: tag = "⚡ 爆量噴發"
+        elif d['Age'] >= OLD_DAYS and d['Vol_1m'] > (BUY_LIMIT_SOL * 2): tag = "💎 老幣回血"
         
-    # 條件 2: 每分鐘買入量 (Velocity Attack)
-    if event['buy_amount'] >= velocity_threshold:
-        signals.append("⚡ VELOCITY_HIGH")
-        
-    # 條件 3: 老幣突然買入 (Dormant Awakening)
-    if event['age'] >= dormant_days and event['buy_amount'] >= (min_buy_sol * surge_multiplier):
-        signals.append("💎 DORMANT_AWAKE")
-        
-    return ", ".join(signals) if signals else None
+        if tag:
+            processed.append({
+                "時間": d['Time'],
+                "平台": d['Platform'],
+                "代幣": d['Symbol'],
+                "CA (點擊複製)": d['CA'], # 這是我們要處理的欄位
+                "市值": f"${d['MCap']:,}",
+                "1min": f"{d['Vol_1m']} SOL",
+                "天數": f"{d['Age']}d",
+                "狀態": tag,
+                "查看": d['Dex']
+            })
+    return processed
 
-# --- UI 渲染 ---
-st.title("🛡️ Solana Protocol Level Monitor")
-st.markdown("---")
+# --- 主畫面 ---
+st.title("🛡️ Solana 實時監測：Alpha Hunter")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Active Protocols", len(PROTOCOL_IDS))
-col2.metric("TPS Scanned", "2,450", "+12%")
-col3.metric("Signals Found (1h)", "14")
-col4.metric("Network Status", "Healthy", delta_color="normal")
+if "data_log" not in st.session_state:
+    st.session_state.data_log = []
 
-# 實時表格
-if "events_log" not in st.session_state:
-    st.session_state.events_log = []
+# 更新數據
+new_entries = fetch_data()
+for ne in new_entries:
+    if ne not in st.session_state.data_log:
+        st.session_state.data_log.insert(0, ne)
 
-placeholder = st.empty()
+# 保持長度
+st.session_state.data_log = st.session_state.data_log[:20]
 
-while True:
-    new_raw = process_protocol_stream()
-    for e in new_raw:
-        sig = analyze_signal(e)
-        if sig:
-            entry = {
-                "Time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                "Platform": e['platform'],
-                "Signal": sig,
-                "Token (Mint)": e['mint'],
-                "MCap": f"${e['mcap']:,}",
-                "Buy Vol": f"{e['buy_amount']} SOL",
-                "Age": f"{e['age']}d"
-            }
-            st.session_state.events_log.insert(0, entry)
+if st.session_state.data_log:
+    df = pd.DataFrame(st.session_state.data_log)
     
-    # 保持日誌長度
-    st.session_state.events_log = st.session_state.events_log[:50]
-    
-    with placeholder.container():
-        df = pd.DataFrame(st.session_state.events_log)
-        if not df.empty:
-            st.dataframe(
-                df.style.applymap(lambda x: 'color: #ff4b4b; font-weight: bold' if "🔥" in str(x) or "⚡" in str(x) else ''),
-                use_container_width=True
-            )
-    
-    time.sleep(2)
+    # 💡 關鍵：使用 Streamlit 的 column_config.TextColumn 搭配複製功能
+    st.dataframe(
+        df,
+        column_config={
+            "CA (點擊複製)": st.column_config.TextColumn(
+                "CA (點擊複製)",
+                help="點擊右側圖標即可複製合約地址",
+                width="medium",
+            ),
+            "查看": st.column_config.LinkColumn("圖表連結")
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("⌛ 等待信號中... 自動刷新中")
+
+# 自動刷新
+time.sleep(5)
+st.rerun()
