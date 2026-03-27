@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import time
 from datetime import datetime, timedelta
 
 # ====================== 頁面基礎配置 ======================
@@ -9,7 +10,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 全局狀態初始化 ======================
+# ====================== 全局狀態初始化（100%持久化，重跑不丟失） ======================
 def init_session():
     if "config" not in st.session_state:
         st.session_state.config = {
@@ -49,6 +50,9 @@ def init_session():
     # 監控運行狀態
     if "monitor_running" not in st.session_state:
         st.session_state.monitor_running = False
+    # 下一次執行監控的時間（核心定時機制）
+    if "next_run_time" not in st.session_state:
+        st.session_state.next_run_time = None
     # 原始數據緩存
     if "raw_token_data" not in st.session_state:
         st.session_state.raw_token_data = []
@@ -84,7 +88,6 @@ def get_solana_tokens():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     try:
-        # 獲取Solana全網最新交易對（最多100條，確保有足夠數據）
         url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
         res = requests.get(url, headers=headers, timeout=15)
         res.raise_for_status()
@@ -92,13 +95,12 @@ def get_solana_tokens():
         
         pools = data.get("data", [])
         formatted_pairs = []
-        st.session_state.raw_token_data = pools  # 緩存原始數據
+        st.session_state.raw_token_data = pools
         
         for pool in pools:
             attributes = pool.get("attributes", {})
             relationships = pool.get("relationships", {})
             
-            # 提取核心數據
             base_token = relationships.get("base_token", {}).get("data", {})
             dex_id = relationships.get("dex", {}).get("data", {}).get("id", "")
             token_name = attributes.get("name", "").lower()
@@ -128,13 +130,12 @@ def get_solana_tokens():
         add_log(f"❌ API獲取失敗: {str(e)[:80]}")
         return []
 
-# ====================== 【修復】5個平台精準識別（適配GeckoTerminal命名） ======================
+# ====================== 5個平台精準識別 ======================
 def parse_platform(pair):
     dex_id = pair.get("dexId", "").lower()
     token_name = pair.get("token_name", "").lower()
     token_symbol = pair.get("token_symbol", "").lower()
     
-    # 精準匹配GeckoTerminal的真實DEX命名
     if "pump" in dex_id:
         return "Pump.fun"
     elif "moonshot" in dex_id:
@@ -148,7 +149,7 @@ def parse_platform(pair):
             return "Zerg.zone"
     return None
 
-# ====================== 【修復】3個條件檢查（簡化邏輯，確保能觸發） ======================
+# ====================== 3個條件檢查（獨立勾選控制） ======================
 def check_conditions(token_data):
     mint = token_data["mint"]
     market_cap = token_data["market_cap"]
@@ -170,22 +171,22 @@ def check_conditions(token_data):
     token_age_days = (datetime.now() - st.session_state.token_create_time[mint]).days
     trigger_reason = None
 
-    # 條件1：市值 ≤ 設定值 + 買入金額達標
+    # 條件1檢查
     if config["cond1_enable"] and market_cap > 0:
         if market_cap <= config["cond1_max_mc"] and buy_1m >= config["cond1_min_buy"]:
             trigger_reason = f"條件1：市值(${market_cap:,.0f}) ≤ 設定上限 + 買入金額(${buy_1m:,.0f})達標"
 
-    # 條件2：1分鐘內買入暴量
+    # 條件2檢查
     if not trigger_reason and config["cond2_enable"]:
         if buy_1m >= config["cond2_min_buy_1m"]:
             trigger_reason = f"條件2：1分鐘買入暴量(${buy_1m:,.0f})"
 
-    # 條件3：超過設定值天數的老幣突然買入
+    # 條件3檢查
     if not trigger_reason and config["cond3_enable"]:
         if token_age_days >= config["cond3_min_days"] and buy_1m >= config["cond3_min_sudden_buy"]:
             trigger_reason = f"條件3：上線{token_age_days}天老幣 突發買入(${buy_1m:,.0f})"
 
-    # 觸發警報（5分鐘去重，避免刷屏）
+    # 觸發警報（5分鐘去重）
     if trigger_reason:
         alert = {
             "time": datetime.now().strftime("%m-%d %H:%M:%S"),
@@ -221,7 +222,7 @@ def run_monitor():
         platform = parse_platform(pair)
         platform_key = platform.lower().replace(" ", "_").replace(".", "_").replace("/", "_") if platform else ""
         
-        # 過濾規則：全平台開啟 或 屬於指定開啟的平台
+        # 過濾規則
         is_allowed = False
         if config["all_platform_enable"]:
             is_allowed = True
@@ -260,12 +261,22 @@ def run_monitor():
 
     add_log(f"📊 本次掃描：符合平台規則 {platform_match_count} 個，實際處理 {processed_count} 個代幣")
 
-# ====================== 自動刷新機制 ======================
+# ====================== 核心定時機制（零閃屏、不停止） ======================
+# 監控啟動狀態處理
 if st.session_state.monitor_running:
-    st.markdown(f"""
-    <meta http-equiv="refresh" content="{config['scan_interval']}">
-    """, unsafe_allow_html=True)
-    run_monitor()
+    # 首次啟動，設置第一次執行時間
+    if st.session_state.next_run_time is None:
+        st.session_state.next_run_time = datetime.now()
+    
+    # 檢查是否到了執行時間
+    if datetime.now() >= st.session_state.next_run_time:
+        run_monitor()
+        # 更新下一次執行時間
+        st.session_state.next_run_time = datetime.now() + timedelta(seconds=config["scan_interval"])
+    
+    # 非阻塞等待，然後軟重跑（瀏覽器不刷新，零閃屏）
+    time.sleep(1)
+    st.rerun()
 
 # ====================== 高級介面樣式（手機自適應） ======================
 st.markdown("""
@@ -335,7 +346,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ====================== 頁面佈局 ======================
+# ====================== 頁面固定佈局（不閃爍） ======================
 st.title("🔥 SOL 多平台代幣實時監控系統")
 st.divider()
 
@@ -358,10 +369,11 @@ with col2:
     </div>
     """, unsafe_allow_html=True)
 with col3:
+    next_run_text = st.session_state.next_run_time.strftime("%H:%M:%S") if st.session_state.next_run_time else "未啟動"
     st.markdown(f"""
     <div class="metric-card">
-        <div style="font-size:14px;color:#9CA3AF;">掃描間隔</div>
-        <div style="font-size:20px;font-weight:bold;color:#90CDF4;">{config['scan_interval']}秒</div>
+        <div style="font-size:14px;color:#9CA3AF;">下次掃描時間</div>
+        <div style="font-size:20px;font-weight:bold;color:#90CDF4;">{next_run_text}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -462,41 +474,49 @@ with col_start:
     if st.button("▶️ 啟動監控", type="primary", use_container_width=True):
         if not st.session_state.monitor_running:
             st.session_state.monitor_running = True
+            st.session_state.next_run_time = datetime.now()
             st.success("✅ 監控已啟動，正在抓取數據...")
             st.rerun()
 with col_stop:
     if st.button("⏹️ 停止監控", use_container_width=True):
         if st.session_state.monitor_running:
             st.session_state.monitor_running = False
+            st.session_state.next_run_time = None
             st.warning("⚠️ 監控已停止")
             st.rerun()
 
 st.divider()
 
-# 警報列表
-st.subheader("📈 實時觸發警報")
-if st.session_state.alerts:
-    for alert in st.session_state.alerts[:30]:
-        st.markdown(f"""
-        <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
-                <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
-            </div>
-            <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
-            <div style="display: flex; justify-content: space-between; margin: 8px 0;">
-                <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
-                <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
-            </div>
-            <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.code(alert['mint'], language="text")
-else:
-    st.info("如果啟動監控後沒有警報，請勾選「開啟全平台監控」，並適當調低觸發門檻")
+# ====================== 動態內容區域（局部更新，不閃屏） ======================
+# 警報列表佔位符
+alert_placeholder = st.empty()
+# 除錯日誌佔位符
+log_placeholder = st.expander("🔍 除錯日誌與原始數據", expanded=False)
 
-# 除錯與原始數據面板
-with st.expander("🔍 除錯日誌與原始數據", expanded=False):
+# 更新動態內容
+with alert_placeholder.container():
+    st.subheader("📈 實時觸發警報")
+    if st.session_state.alerts:
+        for alert in st.session_state.alerts[:30]:
+            st.markdown(f"""
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
+                    <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
+                </div>
+                <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
+                <div style="display: flex; justify-content: space-between; margin: 8px 0;">
+                    <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
+                    <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
+                </div>
+                <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.code(alert['mint'], language="text")
+    else:
+        st.info("如果啟動監控後沒有警報，請勾選「開啟全平台監控」，並適當調低觸發門檻")
+
+with log_placeholder.container():
     st.subheader("系統日誌")
     for log in st.session_state.debug_logs[:20]:
         st.text(log)
