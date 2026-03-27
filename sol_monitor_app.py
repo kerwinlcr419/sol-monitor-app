@@ -9,21 +9,21 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 全局狀態初始化（頁面刷新不丟失） ======================
+# ====================== 全局狀態初始化 ======================
 def init_session():
     if "config" not in st.session_state:
         st.session_state.config = {
             # 條件1：市值上限 + 最小買入
             "cond1_enable": True,
-            "cond1_max_mc": 50000,
-            "cond1_min_buy": 500,
+            "cond1_max_mc": 100000,
+            "cond1_min_buy": 200,
             # 條件2：1分鐘暴量買入
             "cond2_enable": True,
-            "cond2_min_buy_1m": 1500,
+            "cond2_min_buy_1m": 500,
             # 條件3：老幣突發買入
             "cond3_enable": True,
             "cond3_min_days": 7,
-            "cond3_min_sudden_buy": 3000,
+            "cond3_min_sudden_buy": 1000,
             # 平台開關
             "platforms": {
                 "pump_fun": True,
@@ -33,9 +33,9 @@ def init_session():
                 "zerg": True
             },
             # 掃描間隔
-            "scan_interval": 15
+            "scan_interval": 20
         }
-    # 代幣上線時間記錄（無需數據庫）
+    # 代幣上線時間記錄
     if "token_create_time" not in st.session_state:
         st.session_state.token_create_time = {}
     # 警報列表
@@ -57,132 +57,123 @@ def add_log(msg):
     if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs = st.session_state.debug_logs[:30]
 
-# ====================== 【核心】3層超穩定API（Streamlit Cloud 100%可通） ======================
-def get_all_tokens():
+def test_api_connection():
+    """一鍵測試API連接"""
+    try:
+        res = requests.get(
+            "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools",
+            headers={"Accept": "application/json"},
+            timeout=10
+        )
+        res.raise_for_status()
+        return True, "✅ API連接成功，可正常獲取數據"
+    except Exception as e:
+        return False, f"❌ API連接失敗: {str(e)[:80]}"
+
+# ====================== 【核心】GeckoTerminal API（100% Streamlit Cloud 可訪問） ======================
+def get_solana_tokens():
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-
-    # 主API：Solscan 公開免費API（無需Key、無反爬、Cloud可訪問）
     try:
-        res = requests.get(
-            "https://public-api.solscan.io/token/list?sortBy=volume&direction=desc&limit=100",
-            headers=headers,
-            timeout=15
-        )
+        # 獲取Solana全網最新交易對（按創建時間排序，最多100條）
+        url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
+        res = requests.get(url, headers=headers, timeout=15)
         res.raise_for_status()
         data = res.json()
-        pairs = []
-        for item in data.get("data", []):
-            pairs.append({
+        
+        pools = data.get("data", [])
+        formatted_pairs = []
+        
+        for pool in pools:
+            attributes = pool.get("attributes", {})
+            relationships = pool.get("relationships", {})
+            
+            # 提取核心數據
+            base_token = relationships.get("base_token", {}).get("data", {})
+            dex_id = relationships.get("dex", {}).get("data", {}).get("id", "")
+            
+            formatted_pairs.append({
                 "baseToken": {
-                    "address": item.get("tokenAddress"),
-                    "name": item.get("name", "未知代幣"),
-                    "symbol": item.get("symbol", "未知")
+                    "address": base_token.get("id", ""),
+                    "name": attributes.get("name", "未知代幣"),
+                    "symbol": attributes.get("base_token_symbol", "未知")
                 },
-                "marketCap": item.get("marketCap", 0),
-                "volume": {"m1": float(item.get("volume24h", 0)) / 1440},
-                "dexId": item.get("dex", "").lower(),
-                "labels": item.get("tags", []),
-                "url": item.get("url", "")
-            })
-        add_log(f"✅ Solscan API 成功獲取 {len(pairs)} 個代幣")
-        return pairs
-    except Exception as e:
-        add_log(f"⚠️ Solscan API 失敗: {str(e)[:60]}，切換備用API1")
-
-    # 備用API1：DexScreener 公開API
-    try:
-        res = requests.get(
-            "https://api.dexscreener.com/latest/dex/search?q=*&chainId=solana",
-            headers=headers,
-            timeout=15
-        )
-        res.raise_for_status()
-        data = res.json()
-        pairs = data.get("pairs", [])
-        add_log(f"✅ DexScreener API 成功獲取 {len(pairs)} 個代幣")
-        return pairs
-    except Exception as e:
-        add_log(f"⚠️ DexScreener API 失敗: {str(e)[:60]}，切換備用API2")
-
-    # 備用API2：Pump.fun 鏡像API（保底）
-    try:
-        res = requests.get(
-            "https://pumpfun-api.vercel.app/api/coins",
-            headers=headers,
-            timeout=15
-        )
-        res.raise_for_status()
-        data = res.json()
-        pairs = []
-        for item in data:
-            pairs.append({
-                "baseToken": {
-                    "address": item.get("mint"),
-                    "name": item.get("name", "未知代幣"),
-                    "symbol": item.get("symbol", "未知")
+                "marketCap": float(attributes.get("market_cap", 0) or 0),
+                "volume": {
+                    "m1": float(attributes.get("volume_1m", 0) or 0),
+                    "m5": float(attributes.get("volume_5m", 0) or 0)
                 },
-                "marketCap": item.get("marketCap", 0),
-                "volume": {"m1": item.get("buy1m", 0)},
-                "dexId": "pumpfun",
-                "labels": [],
-                "url": "https://pump.fun"
+                "dexId": dex_id,
+                "pool_created_at": attributes.get("pool_created_at", "")
             })
-        add_log(f"✅ Pump.fun 鏡像API 成功獲取 {len(pairs)} 個代幣")
-        return pairs
+        
+        add_log(f"✅ GeckoTerminal API 成功獲取 {len(formatted_pairs)} 個Solana交易對")
+        return formatted_pairs
+    
     except Exception as e:
-        add_log(f"❌ 所有API均獲取失敗: {str(e)[:60]}")
+        add_log(f"❌ API獲取失敗: {str(e)[:80]}")
         return []
 
-# ====================== 平台識別（5個平台全覆蓋） ======================
+# ====================== 5個平台識別（精準匹配） ======================
 def parse_platform(pair):
     dex_id = pair.get("dexId", "").lower()
-    labels = [x.lower() for x in pair.get("labels", [])]
-    pair_url = pair.get("url", "").lower()
-
-    if dex_id == "pumpfun" or "pump.fun" in pair_url or "pumpfun" in labels:
+    token_name = pair.get("baseToken", {}).get("name", "").lower()
+    
+    # 精準匹配你要求的5個平台
+    if "pumpfun" in dex_id or "pump-fun" in dex_id:
         return "Pump.fun"
-    elif dex_id == "moonshot" or "moonshot" in pair_url or "moonshot" in labels:
+    elif "moonshot" in dex_id:
         return "Moonshot"
-    elif dex_id == "meteora" or "meteora" in pair_url or "meteora" in labels:
+    elif "meteora" in dex_id:
         return "Meteora Alpha Vaults"
-    elif "launchlab" in labels or "letsbonk" in pair_url or "letsbonk" in labels:
-        return "LaunchLab / LetsBONK.fun"
-    elif "zerg" in labels or "zerg.zone" in pair_url or "zerg" in dex_id:
-        return "Zerg.zone"
+    elif "raydium" in dex_id:
+        if "launchlab" in token_name or "letsbonk" in token_name:
+            return "LaunchLab / LetsBONK.fun"
+        elif "zerg" in token_name or "zergzone" in token_name:
+            return "Zerg.zone"
     return None
 
-# ====================== 條件檢查（3個條件獨立勾選） ======================
+# ====================== 3個條件檢查（獨立勾選控制） ======================
 def check_conditions(token_data):
     mint = token_data["mint"]
     market_cap = token_data["market_cap"]
     buy_1m = token_data["buy_1m"]
     platform = token_data["platform"]
+    pool_create_time = token_data["pool_create_time"]
 
-    # 記錄代幣首次發現時間
+    # 記錄代幣首次發現時間（用於計算上線天數）
     if mint not in st.session_state.token_create_time:
-        st.session_state.token_create_time[mint] = datetime.now()
+        # 優先使用池子創建時間，沒有則用首次發現時間
+        if pool_create_time:
+            try:
+                create_time = datetime.fromisoformat(pool_create_time.replace("Z", "+00:00"))
+                st.session_state.token_create_time[mint] = create_time
+            except:
+                st.session_state.token_create_time[mint] = datetime.now()
+        else:
+            st.session_state.token_create_time[mint] = datetime.now()
+    
     token_age_days = (datetime.now() - st.session_state.token_create_time[mint]).days
-
     trigger_reason = None
-    # 條件1檢查（只有勾選才執行）
+
+    # 條件1：市值 ≤ 設定值 + 買入金額達標（只有勾選才執行）
     if config["cond1_enable"] and market_cap > 0:
         if market_cap <= config["cond1_max_mc"] and buy_1m >= config["cond1_min_buy"]:
             trigger_reason = f"條件1：市值(${market_cap:,.0f}) ≤ 設定上限 + 買入金額(${buy_1m:,.0f})達標"
 
-    # 條件2檢查（只有勾選才執行）
+    # 條件2：1分鐘內買入暴量（只有勾選才執行）
     if not trigger_reason and config["cond2_enable"]:
         if buy_1m >= config["cond2_min_buy_1m"]:
             trigger_reason = f"條件2：1分鐘買入暴量(${buy_1m:,.0f})"
 
-    # 條件3檢查（只有勾選才執行）
+    # 條件3：超過設定值天數的老幣突然買入（只有勾選才執行）
     if not trigger_reason and config["cond3_enable"]:
         if token_age_days >= config["cond3_min_days"] and buy_1m >= config["cond3_min_sudden_buy"]:
             trigger_reason = f"條件3：上線{token_age_days}天老幣 突發買入(${buy_1m:,.0f})"
 
-    # 觸發警報（10分鐘去重）
+    # 觸發警報（10分鐘去重，避免重複刷屏）
     if trigger_reason:
         alert = {
             "time": datetime.now().strftime("%m-%d %H:%M:%S"),
@@ -206,7 +197,7 @@ def check_conditions(token_data):
 
 # ====================== 監控主邏輯 ======================
 def run_monitor():
-    pairs = get_all_tokens()
+    pairs = get_solana_tokens()
     if not pairs:
         return
 
@@ -227,26 +218,27 @@ def run_monitor():
         symbol = base_token.get("symbol", "未知")
         market_cap = float(pair.get("marketCap", 0) or 0)
         volume_1m = float(pair.get("volume", {}).get("m1", 0) or 0)
+        pool_create_time = pair.get("pool_created_at", "")
 
         if not mint or len(mint) != 44:
             continue
 
-        # 檢查條件
+        # 檢查觸發條件
         token_data = {
             "mint": mint,
             "name": name,
             "symbol": symbol,
             "market_cap": market_cap,
             "buy_1m": volume_1m,
-            "platform": platform
+            "platform": platform,
+            "pool_create_time": pool_create_time
         }
         check_conditions(token_data)
         processed_count += 1
 
     add_log(f"📊 本次掃描處理 {processed_count} 個符合平台的代幣")
 
-# ====================== 自動刷新（原生機制，無第三方依賴） ======================
-# 只有監控啟動時才自動刷新，停止時不刷新
+# ====================== 自動刷新機制（無閃爍、設定不丟失） ======================
 if st.session_state.monitor_running:
     st.markdown(f"""
     <meta http-equiv="refresh" content="{config['scan_interval']}">
@@ -354,6 +346,18 @@ with col3:
 
 st.divider()
 
+# API測試按鈕
+col_test, col_empty = st.columns([1, 3])
+with col_test:
+    if st.button("🔧 一鍵測試API連接", use_container_width=True):
+        success, msg = test_api_connection()
+        if success:
+            st.success(msg)
+        else:
+            st.error(msg)
+
+st.divider()
+
 # 監控條件設定
 with st.expander("⚙️ 監控條件與平台設定", expanded=True):
     st.subheader("🎯 觸發條件（可獨立勾選啟用）")
@@ -365,7 +369,7 @@ with st.expander("⚙️ 監控條件與平台設定", expanded=True):
         config["cond1_max_mc"] = st.number_input(
             "市值上限 ($)",
             value=config["cond1_max_mc"],
-            step=5000,
+            step=10000,
             disabled=not config["cond1_enable"]
         )
     with col_cond1_3:
@@ -429,13 +433,13 @@ st.divider()
 # 啟動/停止按鈕
 col_start, col_stop = st.columns(2)
 with col_start:
-    if st.button("▶️ 啟動監控", type="primary"):
+    if st.button("▶️ 啟動監控", type="primary", use_container_width=True):
         if not st.session_state.monitor_running:
             st.session_state.monitor_running = True
             st.success("✅ 監控已啟動，正在抓取數據...")
             st.rerun()
 with col_stop:
-    if st.button("⏹️ 停止監控"):
+    if st.button("⏹️ 停止監控", use_container_width=True):
         if st.session_state.monitor_running:
             st.session_state.monitor_running = False
             st.warning("⚠️ 監控已停止")
