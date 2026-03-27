@@ -1,13 +1,9 @@
-import time
-import json
-import sqlite3
-import threading
-from datetime import datetime
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+import streamlit as st
 import requests
-
-app = FastAPI()
+import sqlite3
+import time
+from datetime import datetime
+import threading
 
 # ====================== 配置 ======================
 CONFIG = {
@@ -19,7 +15,9 @@ CONFIG = {
     "SCAN_INTERVAL": 60,
 }
 
-ALERTS = []
+# 全局警报列表
+if "alerts" not in st.session_state:
+    st.session_state.alerts = []
 
 # ====================== 数据库 ======================
 def init_db():
@@ -134,13 +132,10 @@ def check_token(token):
     save_token(mint, platform)
 
     reason = None
-
     if mc <= CONFIG["MAX_MARKET_CAP"] and buy >= CONFIG["CONDITION_1_MIN_BUY"]:
         reason = "低市值 + 买入达标"
-
     elif buy >= CONFIG["CONDITION_2_MIN_BUY_1MIN"]:
         reason = "1分钟买入暴量"
-
     elif days >= CONFIG["CONDITION_3_OLD_TOKEN_DAYS"] and buy >= CONFIG["CONDITION_3_SUDDEN_BUY"]:
         reason = f"老币{days}天 突然大额买入"
 
@@ -153,9 +148,9 @@ def check_token(token):
             "buy1m": round(buy, 2),
             "reason": reason
         }
-        ALERTS.insert(0, alert)
-        if len(ALERTS) > 100:
-            del ALERTS[100:]
+        st.session_state.alerts.insert(0, alert)
+        if len(st.session_state.alerts) > 100:
+            st.session_state.alerts = st.session_state.alerts[:100]
 
 # ====================== 监控线程 ======================
 def monitor_thread():
@@ -170,57 +165,45 @@ def monitor_thread():
                 pass
         time.sleep(CONFIG["SCAN_INTERVAL"])
 
-# ====================== 手机自适应网页界面 ======================
-@app.get("/", response_class=HTMLResponse)
-def home():
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SOL 监测</title>
-        <style>
-            * {{ margin:0; padding:0; box-sizing:border-box; font-family:system-ui; }}
-            body {{ background:#0b0f1a; color:#eaecef; padding:12px; }}
-            .title {{ text-align:center; font-size:22px; margin-bottom:12px; color:#ffdd57; }}
-            .config {{ background:#121a29; padding:10px; border-radius:12px; margin-bottom:12px; font-size:14px; }}
-            .alert {{ background:#151c30; padding:10px; border-radius:10px; margin-bottom:8px;
-                      border-left:3px solid #ffdd57; font-size:14px; }}
-            .platform {{ color:#7ccfff; font-weight:bold; }}
-            .reason {{ color:#ff7070; margin-top:4px; }}
-            .mint {{ color:#aaa; word-break:break-all; font-size:12px; margin-top:4px; }}
-        </style>
-    </head>
-    <body>
-        <div class="title">SOL 多平台代币监测</div>
+# ====================== Streamlit 界面（手机自适应） ======================
+st.set_page_config(page_title="SOL 监测", layout="wide")
+st.title("🔥 SOL 多平台代币监测")
 
-        <div class="config">
-            市值上限: ${CONFIG['MAX_MARKET_CAP']}<br>
-            1分钟买入: ≥${CONFIG['CONDITION_2_MIN_BUY_1MIN']}<br>
-            老币天数: {CONFIG['CONDITION_3_OLD_TOKEN_DAYS']}天
-        </div>
-    """
+# 配置面板
+with st.expander("📊 监控条件设置", expanded=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        CONFIG["MAX_MARKET_CAP"] = st.number_input("市值上限 ($)", value=CONFIG["MAX_MARKET_CAP"])
+        CONFIG["CONDITION_1_MIN_BUY"] = st.number_input("条件1 最小买入 ($)", value=CONFIG["CONDITION_1_MIN_BUY"])
+        CONFIG["CONDITION_2_MIN_BUY_1MIN"] = st.number_input("条件2 1分钟买入 ($)", value=CONFIG["CONDITION_2_MIN_BUY_1MIN"])
+    with col2:
+        CONFIG["CONDITION_3_OLD_TOKEN_DAYS"] = st.number_input("条件3 老币天数", value=CONFIG["CONDITION_3_OLD_TOKEN_DAYS"], step=1)
+        CONFIG["CONDITION_3_SUDDEN_BUY"] = st.number_input("条件3 突然买入 ($)", value=CONFIG["CONDITION_3_SUDDEN_BUY"])
+        CONFIG["SCAN_INTERVAL"] = st.number_input("扫描间隔 (秒)", value=CONFIG["SCAN_INTERVAL"], step=10)
 
-    for a in ALERTS[:30]:
-        html += f'''
-        <div class="alert">
-            <div class="platform">{a['platform']}</div>
-            <div>市值: ${a['mc']}　买入1m: ${a['buy1m']}</div>
-            <div class="reason">{a['reason']}</div>
-            <div class="mint">{a['mint']}</div>
-            <div style="font-size:11px;color:#888;margin-top:4px;">{a['time']}</div>
-        </div>
-        '''
-
-    html += """
-    </body>
-    </html>
-    """
-    return html
-
-# ====================== 启动 ======================
-if __name__ == "__main__":
+# 启动监控线程
+if "monitor_started" not in st.session_state:
+    st.session_state.monitor_started = True
     threading.Thread(target=monitor_thread, daemon=True).start()
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    st.success("✅ 监控已启动")
+
+# 警报列表
+st.subheader("📈 实时警报")
+if st.session_state.alerts:
+    for alert in st.session_state.alerts[:30]:
+        with st.container(border=True):
+            st.markdown(f"**平台**: {alert['platform']} | **时间**: {alert['time']}")
+            st.markdown(f"市值: `${alert['mc']}` | 1分钟买入: `${alert['buy1m']}`")
+            st.markdown(f"**触发原因**: {alert['reason']}")
+            st.code(alert['mint'], language="text")
+else:
+    st.info("暂无警报，监控运行中...")
+
+# 自动刷新
+st.markdown("""
+    <script>
+        setTimeout(function(){
+            window.location.reload();
+        }, 60000);
+    </script>
+""", unsafe_allow_html=True)
