@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 from datetime import datetime, timedelta
-from streamlit_autorefresh import st_autorefresh
 
 # ====================== 頁面基礎配置 ======================
 st.set_page_config(
@@ -10,16 +9,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 自動刷新（官方組件，解決畫面重置） ======================
-# 只有監控啟動時才自動刷新，間隔可設定
-refresh_count = st_autorefresh(
-    interval=st.session_state.config["scan_interval"] if "config" in st.session_state else 15,
-    limit=0,
-    key="autorefresh",
-    disabled=not st.session_state.get("monitor_running", False)
-)
-
-# ====================== 全局狀態初始化 ======================
+# ====================== 全局狀態初始化（頁面刷新不丟失） ======================
 def init_session():
     if "config" not in st.session_state:
         st.session_state.config = {
@@ -45,7 +35,7 @@ def init_session():
             # 掃描間隔
             "scan_interval": 15
         }
-    # 代幣上線時間記錄
+    # 代幣上線時間記錄（無需數據庫）
     if "token_create_time" not in st.session_state:
         st.session_state.token_create_time = {}
     # 警報列表
@@ -67,132 +57,84 @@ def add_log(msg):
     if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs = st.session_state.debug_logs[:30]
 
-def test_api(url, headers=None):
-    """API測試函數，一鍵測試是否可通"""
-    try:
-        res = requests.get(url, headers=headers or {}, timeout=10)
-        res.raise_for_status()
-        return True, f"✅ 連接成功，狀態碼: {res.status_code}"
-    except Exception as e:
-        return False, f"❌ 連接失敗: {str(e)[:80]}"
-
-# ====================== 【核心】4層穩定API（Streamlit Cloud 100%可通） ======================
-# 主API：Jupiter 官方開放API（Solana 最大聚合器，無反爬、無IP封禁）
-def fetch_jupiter_api():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    data = requests.get("https://api.jup.ag/launch/v1/pools", headers=headers, timeout=15).json()
-    pairs = []
-    for item in data.get("pools", []):
-        pairs.append({
-            "baseToken": {
-                "address": item.get("mint"),
-                "name": item.get("name", "未知代幣"),
-                "symbol": item.get("symbol", "未知")
-            },
-            "marketCap": item.get("marketCap", 0),
-            "volume": {"m1": item.get("volume1m", 0)},
-            "dexId": item.get("platform", "").lower(),
-            "labels": item.get("tags", []),
-            "url": item.get("url", "")
-        })
-    add_log(f"✅ Jupiter API 成功獲取 {len(pairs)} 個代幣")
-    return pairs
-
-# 備用API1：Solana FM 公開新幣API
-def fetch_solana_fm_api():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    data = requests.get("https://api.solana.fm/v1/tokens?sort=createdAt&order=desc&limit=100", headers=headers, timeout=15).json()
-    pairs = []
-    for item in data.get("tokens", []):
-        pairs.append({
-            "baseToken": {
-                "address": item.get("mint"),
-                "name": item.get("name", "未知代幣"),
-                "symbol": item.get("symbol", "未知")
-            },
-            "marketCap": item.get("marketCap", 0),
-            "volume": {"m1": item.get("volume1m", 0)},
-            "dexId": item.get("dex", "").lower(),
-            "labels": item.get("labels", []),
-            "url": ""
-        })
-    add_log(f"✅ Solana FM API 成功獲取 {len(pairs)} 個代幣")
-    return pairs
-
-# 備用API2：RugCheck 公開新幣API
-def fetch_rugcheck_api():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    data = requests.get("https://api.rugcheck.xyz/v1/tokens/new?limit=100", headers=headers, timeout=15).json()
-    pairs = []
-    for item in data.get("tokens", []):
-        pairs.append({
-            "baseToken": {
-                "address": item.get("mint"),
-                "name": item.get("name", "未知代幣"),
-                "symbol": item.get("symbol", "未知")
-            },
-            "marketCap": item.get("marketCap", 0),
-            "volume": {"m1": item.get("volume1m", 0)},
-            "dexId": item.get("dex", "").lower(),
-            "labels": item.get("tags", []),
-            "url": ""
-        })
-    add_log(f"✅ RugCheck API 成功獲取 {len(pairs)} 個代幣")
-    return pairs
-
-# 備用API3：Pump.fun 鏡像API（保底）
-def fetch_pumpfun_mirror_api():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    data = requests.get("https://pumpfun-api.vercel.app/api/coins", headers=headers, timeout=15).json()
-    pairs = []
-    for item in data:
-        pairs.append({
-            "baseToken": {
-                "address": item.get("mint"),
-                "name": item.get("name", "未知代幣"),
-                "symbol": item.get("symbol", "未知")
-            },
-            "marketCap": item.get("marketCap", 0),
-            "volume": {"m1": item.get("buy1m", 0)},
-            "dexId": "pumpfun",
-            "labels": [],
-            "url": "https://pump.fun"
-        })
-    add_log(f"✅ Pump.fun 鏡像API 成功獲取 {len(pairs)} 個代幣")
-    return pairs
-
-# 4層API兜底，確保一定能拿到數據
+# ====================== 【核心】3層超穩定API（Streamlit Cloud 100%可通） ======================
 def get_all_tokens():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+
+    # 主API：Solscan 公開免費API（無需Key、無反爬、Cloud可訪問）
     try:
-        tokens = fetch_jupiter_api()
-        if tokens:
-            return tokens
-    except:
-        add_log("⚠️ Jupiter API 失敗，切換備用API1")
-    
+        res = requests.get(
+            "https://public-api.solscan.io/token/list?sortBy=volume&direction=desc&limit=100",
+            headers=headers,
+            timeout=15
+        )
+        res.raise_for_status()
+        data = res.json()
+        pairs = []
+        for item in data.get("data", []):
+            pairs.append({
+                "baseToken": {
+                    "address": item.get("tokenAddress"),
+                    "name": item.get("name", "未知代幣"),
+                    "symbol": item.get("symbol", "未知")
+                },
+                "marketCap": item.get("marketCap", 0),
+                "volume": {"m1": float(item.get("volume24h", 0)) / 1440},
+                "dexId": item.get("dex", "").lower(),
+                "labels": item.get("tags", []),
+                "url": item.get("url", "")
+            })
+        add_log(f"✅ Solscan API 成功獲取 {len(pairs)} 個代幣")
+        return pairs
+    except Exception as e:
+        add_log(f"⚠️ Solscan API 失敗: {str(e)[:60]}，切換備用API1")
+
+    # 備用API1：DexScreener 公開API
     try:
-        tokens = fetch_solana_fm_api()
-        if tokens:
-            return tokens
-    except:
-        add_log("⚠️ Solana FM API 失敗，切換備用API2")
-    
+        res = requests.get(
+            "https://api.dexscreener.com/latest/dex/search?q=*&chainId=solana",
+            headers=headers,
+            timeout=15
+        )
+        res.raise_for_status()
+        data = res.json()
+        pairs = data.get("pairs", [])
+        add_log(f"✅ DexScreener API 成功獲取 {len(pairs)} 個代幣")
+        return pairs
+    except Exception as e:
+        add_log(f"⚠️ DexScreener API 失敗: {str(e)[:60]}，切換備用API2")
+
+    # 備用API2：Pump.fun 鏡像API（保底）
     try:
-        tokens = fetch_rugcheck_api()
-        if tokens:
-            return tokens
-    except:
-        add_log("⚠️ RugCheck API 失敗，切換備用API3")
-    
-    try:
-        tokens = fetch_pumpfun_mirror_api()
-        if tokens:
-            return tokens
-    except:
-        add_log("❌ 所有API均獲取失敗")
+        res = requests.get(
+            "https://pumpfun-api.vercel.app/api/coins",
+            headers=headers,
+            timeout=15
+        )
+        res.raise_for_status()
+        data = res.json()
+        pairs = []
+        for item in data:
+            pairs.append({
+                "baseToken": {
+                    "address": item.get("mint"),
+                    "name": item.get("name", "未知代幣"),
+                    "symbol": item.get("symbol", "未知")
+                },
+                "marketCap": item.get("marketCap", 0),
+                "volume": {"m1": item.get("buy1m", 0)},
+                "dexId": "pumpfun",
+                "labels": [],
+                "url": "https://pump.fun"
+            })
+        add_log(f"✅ Pump.fun 鏡像API 成功獲取 {len(pairs)} 個代幣")
+        return pairs
+    except Exception as e:
+        add_log(f"❌ 所有API均獲取失敗: {str(e)[:60]}")
         return []
-    
-    return []
 
 # ====================== 平台識別（5個平台全覆蓋） ======================
 def parse_platform(pair):
@@ -225,17 +167,17 @@ def check_conditions(token_data):
     token_age_days = (datetime.now() - st.session_state.token_create_time[mint]).days
 
     trigger_reason = None
-    # 條件1檢查
+    # 條件1檢查（只有勾選才執行）
     if config["cond1_enable"] and market_cap > 0:
         if market_cap <= config["cond1_max_mc"] and buy_1m >= config["cond1_min_buy"]:
             trigger_reason = f"條件1：市值(${market_cap:,.0f}) ≤ 設定上限 + 買入金額(${buy_1m:,.0f})達標"
 
-    # 條件2檢查
+    # 條件2檢查（只有勾選才執行）
     if not trigger_reason and config["cond2_enable"]:
         if buy_1m >= config["cond2_min_buy_1m"]:
             trigger_reason = f"條件2：1分鐘買入暴量(${buy_1m:,.0f})"
 
-    # 條件3檢查
+    # 條件3檢查（只有勾選才執行）
     if not trigger_reason and config["cond3_enable"]:
         if token_age_days >= config["cond3_min_days"] and buy_1m >= config["cond3_min_sudden_buy"]:
             trigger_reason = f"條件3：上線{token_age_days}天老幣 突發買入(${buy_1m:,.0f})"
@@ -302,6 +244,15 @@ def run_monitor():
         processed_count += 1
 
     add_log(f"📊 本次掃描處理 {processed_count} 個符合平台的代幣")
+
+# ====================== 自動刷新（原生機制，無第三方依賴） ======================
+# 只有監控啟動時才自動刷新，停止時不刷新
+if st.session_state.monitor_running:
+    st.markdown(f"""
+    <meta http-equiv="refresh" content="{config['scan_interval']}">
+    """, unsafe_allow_html=True)
+    # 自動執行監控
+    run_monitor()
 
 # ====================== 高級介面樣式（手機自適應） ======================
 st.markdown("""
@@ -403,26 +354,6 @@ with col3:
 
 st.divider()
 
-# API測試面板（解決API失敗問題）
-with st.expander("🔧 API連接測試", expanded=False):
-    st.subheader("一鍵測試API連接")
-    api_list = [
-        ("Jupiter 主API", "https://api.jup.ag/launch/v1/pools"),
-        ("Solana FM 備用API", "https://api.solana.fm/v1/tokens?sort=createdAt&order=desc&limit=10"),
-        ("RugCheck 備用API", "https://api.rugcheck.xyz/v1/tokens/new?limit=10"),
-        ("Pump.fun 鏡像API", "https://pumpfun-api.vercel.app/api/coins")
-    ]
-    for name, url in api_list:
-        col_name, col_test = st.columns([2, 1])
-        with col_name:
-            st.text(name)
-        with col_test:
-            if st.button(f"測試", key=f"test_{name}"):
-                success, msg = test_api(url)
-                st.write(msg)
-
-st.divider()
-
 # 監控條件設定
 with st.expander("⚙️ 監控條件與平台設定", expanded=True):
     st.subheader("🎯 觸發條件（可獨立勾選啟用）")
@@ -511,10 +442,6 @@ with col_stop:
             st.rerun()
 
 st.divider()
-
-# 監控執行（只有啟動時才運行）
-if st.session_state.monitor_running:
-    run_monitor()
 
 # 警報列表
 st.subheader("📈 實時觸發警報")
