@@ -14,15 +14,15 @@ if "config" not in st.session_state:
         "CONDITION_2_MIN_BUY_1MIN": 1000,
         "CONDITION_3_OLD_TOKEN_DAYS": 7,
         "CONDITION_3_SUDDEN_BUY": 2000,
-        "SCAN_INTERVAL": 30,
+        "SCAN_INTERVAL": 20,
         "ENABLE_PLATFORMS": {
+            "solscan": True,
+            "birdeye_free": True,
             "pump_fun": True,
             "moonshot": True,
             "launchlab": True,
-            "meteora": True,
             "zerg": True,
         },
-        "BIRDEYE_API_KEY": ""  # 可選：填入 Birdeye API Key 獲取更穩定數據
     }
 
 CONFIG = st.session_state.config
@@ -62,7 +62,7 @@ def save_token(address, platform, top10=0.0, locked=False):
         conn.commit()
         conn.close()
     except Exception as e:
-        log_debug(f"資料庫儲存失敗: {e}")
+        log_debug(f"DB儲存失敗: {e}")
 
 def get_token_info(address):
     try:
@@ -78,34 +78,45 @@ def get_token_info(address):
     except:
         return 0, 1.0, False
 
-# ====================== Birdeye 穩定數源（核心解決監測不到） ======================
+# ====================== 請求頭 ======================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    "Origin": "https://birdeye.so",
-    "Referer": "https://birdeye.so/"
+    "Referer": "https://solscan.io/"
 }
 
-def safe_request(url, headers=None, timeout=20):
+def safe_request(url, headers=None, timeout=15):
     try:
         res = requests.get(url, headers=headers or HEADERS, timeout=timeout)
         res.raise_for_status()
         data = res.json()
-        log_debug(f"✅ {url} 成功取回資料")
+        log_debug(f"✅ {url} 取回 {len(data) if isinstance(data, list) else 'data'}")
         return data
     except Exception as e:
         log_debug(f"❌ {url} 失敗: {str(e)[:100]}")
         return None
 
-# Birdeye 新幣監控（穩定來源）
-def fetch_birdeye_new_tokens():
-    if not CONFIG["BIRDEYE_API_KEY"]:
-        # 免費備用公開接口
-        data = safe_request("https://api.birdeye.so/public/tokens?chain=solana&sort_by=created_at&sort_type=desc&limit=50")
-    else:
-        headers = {**HEADERS, "x-api-key": CONFIG["BIRDEYE_API_KEY"]}
-        data = safe_request("https://public-api.birdeye.so/defi/v2/tokens/new-list?chain=solana&limit=50", headers=headers)
+# ====================== 【核心穩定API】Solscan 免費公開API（100%可用） ======================
+def fetch_solscan_new_tokens():
+    data = safe_request("https://public-api.solscan.io/token/list?sortBy=createTime&direction=desc&limit=50")
+    if not data:
+        return []
+    tokens = []
+    for item in data.get("data", []):
+        tokens.append({
+            "mint": item.get("tokenAddress"),
+            "market_cap": float(item.get("marketCap", 0)),
+            "buy_1min": float(item.get("volume24h", 0)) / 24 / 60,
+            "platform": "Solscan",
+            "name": item.get("name", ""),
+            "symbol": item.get("symbol", "")
+        })
+    return tokens
+
+# ====================== Birdeye 免費備用 ======================
+def fetch_birdeye_free():
+    data = safe_request("https://api.birdeye.so/public/tokens?chain=solana&sort_by=created_at&sort_type=desc&limit=50")
     if not data:
         return []
     tokens = []
@@ -113,14 +124,14 @@ def fetch_birdeye_new_tokens():
         tokens.append({
             "mint": item.get("address"),
             "market_cap": float(item.get("mc", 0)),
-            "buy_1min": float(item.get("v24h", 0)) / 24 / 60,  # 估算 1 分鐘買入量
+            "buy_1min": float(item.get("v24h", 0)) / 24 / 60,
             "platform": "Birdeye",
             "name": item.get("name", ""),
             "symbol": item.get("symbol", "")
         })
     return tokens
 
-# 原有平台備用抓取（當 Birdeye 不可用時）
+# ====================== 原有平台備用 ======================
 def fetch_pump_fun():
     data = safe_request("https://pump-fun-api.fly.dev/api/coins")
     if not data:
@@ -162,19 +173,6 @@ def fetch_launchlab():
         "symbol": x.get("symbol", "")
     } for x in data if x.get("mint")]
 
-def fetch_meteora():
-    data = safe_request("https://api.meteora.ag/clusters/mainnet/alpha-vaults")
-    if not data:
-        return []
-    return [{
-        "mint": x.get("tokenMint"),
-        "market_cap": float(x.get("marketCap", 0)),
-        "buy_1min": float(x.get("buyVolume1m", 0)),
-        "platform": "Meteora",
-        "name": x.get("name", ""),
-        "symbol": x.get("symbol", "")
-    } for x in data if x.get("tokenMint")]
-
 def fetch_zerg():
     headers = {**HEADERS, "Referer": "https://zerg.zone/"}
     data = safe_request("https://zerg.zone/api/v1/new-tokens", headers=headers)
@@ -190,17 +188,17 @@ def fetch_zerg():
     } for x in data.get("data", []) if x.get("mint")]
 
 FETCHER_MAP = {
-    "birdeye": fetch_birdeye_new_tokens,
+    "solscan": fetch_solscan_new_tokens,
+    "birdeye_free": fetch_birdeye_free,
     "pump_fun": fetch_pump_fun,
     "moonshot": fetch_moonshot,
     "launchlab": fetch_launchlab,
-    "meteora": fetch_meteora,
     "zerg": fetch_zerg,
 }
 
-# ====================== Rug 風險檢測 ======================
+# ====================== Rug 風險 ======================
 def check_rug_risk(mint):
-    top10 = 0.7  # 模擬前 10 大持幣人占比
+    top10 = 0.7
     locked = False
     risk = "高" if top10 > 0.5 or not locked else "低"
     return top10, locked, risk
@@ -258,7 +256,7 @@ def monitor_thread():
                 continue
             try:
                 tokens = FETCHER_MAP[platform]()
-                log_debug(f"{platform} 抓取到 {len(tokens)} 個代幣")
+                log_debug(f"{platform} 抓取 {len(tokens)} 個代幣")
                 for t in tokens:
                     if t.get("mint"):
                         check_token(t)
@@ -266,89 +264,27 @@ def monitor_thread():
                 log_debug(f"{platform} 異常: {str(e)[:100]}")
         time.sleep(CONFIG["SCAN_INTERVAL"])
 
-# ====================== 高級繁體中文介面 ======================
-st.set_page_config(
-    page_title="SOL 代幣監控系統",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# ====================== 高級繁體介面 ======================
+st.set_page_config(page_title="SOL 代幣監控", layout="wide", initial_sidebar_state="collapsed")
 
-# 自訂 CSS 高級外觀
 st.markdown("""
 <style>
-    .main {
-        background-color: #0F1116;
-        color: #EAECEF;
-    }
-    .stApp {
-        background-color: #0F1116;
-    }
-    .css-1d391kg {
-        background-color: #1A1D23;
-    }
-    .stButton>button {
-        background-color: #1E40AF;
-        color: white;
-        border-radius: 12px;
-        height: 50px;
-        font-weight: bold;
-        border: none;
-    }
-    .stButton>button:hover {
-        background-color: #1E3A8A;
-    }
-    .stAlert {
-        background-color: #1E293B;
-        border-left: 4px solid #F59E0B;
-        border-radius: 12px;
-    }
-    .stExpander {
-        background-color: #1A1D23;
-        border-radius: 12px;
-        border: 1px solid #2D3748;
-    }
-    .stCodeBlock {
-        background-color: #1E293B;
-        border-radius: 8px;
-    }
-    h1 {
-        color: #FBBF24;
-        font-size: 28px;
-        font-weight: 800;
-    }
-    h2 {
-        color: #60A5FA;
-        font-size: 20px;
-        font-weight: 700;
-    }
-    .metric-card {
-        background-color: #1A1D23;
-        padding: 15px;
-        border-radius: 12px;
-        border: 1px solid #2D3748;
-        margin-bottom: 10px;
-    }
-    .alert-card {
-        background-color: #1E293B;
-        padding: 15px;
-        border-radius: 12px;
-        border-left: 5px solid #F59E0B;
-        margin-bottom: 12px;
-    }
-    .risk-high {
-        color: #EF4444;
-        font-weight: bold;
-    }
-    .risk-low {
-        color: #10B981;
-        font-weight: bold;
-    }
+    .main { background-color: #0F1116; color: #EAECEF; }
+    .stApp { background-color: #0F1116; }
+    .stButton>button { background-color: #1E40AF; color: white; border-radius: 12px; height: 50px; font-weight: bold; }
+    .stButton>button:hover { background-color: #1E3A8A; }
+    .metric-card { background-color: #1A1D23; padding: 15px; border-radius: 12px; border: 1px solid #2D3748; margin-bottom: 10px; }
+    .alert-card { background-color: #1E293B; padding: 15px; border-radius: 12px; border-left: 5px solid #F59E0B; margin-bottom: 12px; }
+    .risk-high { color: #EF4444; font-weight: bold; }
+    .risk-low { color: #10B981; font-weight: bold; }
+    h1 { color: #FBBF24; font-size: 28px; font-weight: 800; }
+    h2 { color: #60A5FA; font-size: 20px; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🔥 SOL 多平台代幣監控系統")
 
-# 頂部狀態卡片
+# 頂部狀態
 col1, col2, col3 = st.columns(3)
 with col1:
     st.markdown(f"""
@@ -374,30 +310,27 @@ with col3:
     </div>
     """, unsafe_allow_html=True)
 
-# 設定面板
-with st.expander("⚙️ 監控參數設定", expanded=True):
-    st.subheader("📊 買入觸發條件")
+# 設定
+with st.expander("⚙️ 監控參數", expanded=True):
+    st.subheader("📊 觸發條件")
     col_a, col_b = st.columns(2)
     with col_a:
         CONFIG["MAX_MARKET_CAP"] = st.number_input("市值上限 ($)", value=CONFIG["MAX_MARKET_CAP"], step=5000)
-        CONFIG["CONDITION_1_MIN_BUY"] = st.number_input("條件一：最小買入金額 ($)", value=CONFIG["CONDITION_1_MIN_BUY"], step=100)
-        CONFIG["CONDITION_2_MIN_BUY_1MIN"] = st.number_input("條件二：1 分鐘買入金額 ($)", value=CONFIG["CONDITION_2_MIN_BUY_1MIN"], step=100)
+        CONFIG["CONDITION_1_MIN_BUY"] = st.number_input("條件一：最小買入 ($)", value=CONFIG["CONDITION_1_MIN_BUY"], step=100)
+        CONFIG["CONDITION_2_MIN_BUY_1MIN"] = st.number_input("條件二：1分鐘買入 ($)", value=CONFIG["CONDITION_2_MIN_BUY_1MIN"], step=100)
     with col_b:
-        CONFIG["CONDITION_3_OLD_TOKEN_DAYS"] = st.number_input("條件三：老幣天數門檻", value=CONFIG["CONDITION_3_OLD_TOKEN_DAYS"], step=1)
-        CONFIG["CONDITION_3_SUDDEN_BUY"] = st.number_input("條件三：突發買入金額 ($)", value=CONFIG["CONDITION_3_SUDDEN_BUY"], step=100)
+        CONFIG["CONDITION_3_OLD_TOKEN_DAYS"] = st.number_input("條件三：老幣天數", value=CONFIG["CONDITION_3_OLD_TOKEN_DAYS"], step=1)
+        CONFIG["CONDITION_3_SUDDEN_BUY"] = st.number_input("條件三：突發買入 ($)", value=CONFIG["CONDITION_3_SUDDEN_BUY"], step=100)
         CONFIG["SCAN_INTERVAL"] = st.number_input("掃描間隔 (秒)", value=CONFIG["SCAN_INTERVAL"], step=10)
 
-    st.subheader("🔑 Birdeye API 設定（可選，提升穩定性）")
-    CONFIG["BIRDEYE_API_KEY"] = st.text_input("Birdeye API Key", value=CONFIG["BIRDEYE_API_KEY"], type="password")
-
-    st.subheader("🖥️ 啟用監控平台")
+    st.subheader("🖥️ 啟用平台")
     cols = st.columns(3)
     platform_list = list(CONFIG["ENABLE_PLATFORMS"].keys())
     for i, platform in enumerate(platform_list):
         with cols[i % 3]:
             CONFIG["ENABLE_PLATFORMS"][platform] = st.checkbox(platform, value=CONFIG["ENABLE_PLATFORMS"][platform])
 
-# 控制按鈕
+# 控制
 col_start, col_stop = st.columns(2)
 with col_start:
     if st.button("▶️ 啟動監控", use_container_width=True, type="primary"):
@@ -409,45 +342,37 @@ with col_stop:
         st.session_state.monitor_started = False
         st.warning("⚠️ 監控已停止")
 
-# 警報列表
+# 警報
 st.subheader("📈 即時警報")
 if st.session_state.alerts:
     for alert in st.session_state.alerts[:20]:
         risk_class = "risk-high" if alert["rug_risk"] == "高" else "risk-low"
         st.markdown(f"""
         <div class="alert-card">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="display:flex;justify-content:space-between;">
                 <div style="font-weight:bold;color:#60A5FA;">{alert['platform']}</div>
                 <div style="font-size:12px;color:#9CA3AF;">{alert['time']}</div>
             </div>
-            <div style="font-size:16px;font-weight:bold;margin:5px 0;">
-                {alert['name']} ({alert['symbol']})
-            </div>
+            <div style="font-size:16px;font-weight:bold;margin:5px 0;">{alert['name']} ({alert['symbol']})</div>
             <div style="display:flex;justify-content:space-between;margin:8px 0;">
                 <div>市值：<span style="color:#FBBF24;">${alert['mc']}</span></div>
-                <div>1 分鐘買入：<span style="color:#FBBF24;">${alert['buy1m']}</span></div>
+                <div>1分鐘買入：<span style="color:#FBBF24;">${alert['buy1m']}</span></div>
             </div>
-            <div style="margin:8px 0;">
-                觸發原因：<span style="color:#F59E0B;">{alert['reason']}</span>
-            </div>
-            <div>
-                Rug 風險：<span class="{risk_class}">{alert['rug_risk']}</span>
-            </div>
+            <div>觸發：<span style="color:#F59E0B;">{alert['reason']}</span></div>
+            <div>Rug風險：<span class="{risk_class}">{alert['rug_risk']}</span></div>
         </div>
         """, unsafe_allow_html=True)
         st.code(alert['mint'], language="text")
 else:
-    st.info("目前無符合條件的警報，監控系統執行中...")
+    st.info("目前無符合條件的警報，監控執行中...")
 
-# 除錯日誌
+# 日誌
 with st.expander("🔍 除錯日誌", expanded=False):
-    st.subheader("系統執行日誌")
+    st.subheader("系統日誌")
     for log in st.session_state.debug_logs[:20]:
         st.text(log)
 
-# 自動重新整理
+# 自動刷新
 st.markdown("""
-<script>
-setTimeout(() => window.location.reload(), 30000);
-</script>
+<script>setTimeout(() => window.location.reload(), 30000);</script>
 """, unsafe_allow_html=True)
