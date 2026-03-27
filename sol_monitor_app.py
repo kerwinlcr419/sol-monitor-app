@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -10,22 +11,27 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 全局狀態初始化（100%持久化，重跑不丟失） ======================
+# ====================== 全局狀態初始化（線程安全） ======================
 def init_session():
+    # 核心監控狀態
+    if "monitor_running" not in st.session_state:
+        st.session_state.monitor_running = False
+    if "stop_event" not in st.session_state:
+        st.session_state.stop_event = threading.Event()
+    if "monitor_thread" not in st.session_state:
+        st.session_state.monitor_thread = None
+    
+    # 配置參數
     if "config" not in st.session_state:
         st.session_state.config = {
-            # 條件1：市值上限 + 最小買入
             "cond1_enable": True,
             "cond1_max_mc": 1000000,
             "cond1_min_buy": 50,
-            # 條件2：1分鐘暴量買入
             "cond2_enable": True,
             "cond2_min_buy_1m": 100,
-            # 條件3：老幣突發買入
             "cond3_enable": True,
             "cond3_min_days": 1,
             "cond3_min_sudden_buy": 200,
-            # 平台開關
             "platforms": {
                 "pump_fun": True,
                 "moonshot": True,
@@ -33,35 +39,26 @@ def init_session():
                 "meteora": True,
                 "zerg": True,
             },
-            # 全平台監控開關（保底）
             "all_platform_enable": False,
-            # 掃描間隔
             "scan_interval": 20
         }
-    # 代幣上線時間記錄
+    
+    # 數據存儲
     if "token_create_time" not in st.session_state:
         st.session_state.token_create_time = {}
-    # 警報列表
     if "alerts" not in st.session_state:
         st.session_state.alerts = []
-    # 除錯日誌
     if "debug_logs" not in st.session_state:
         st.session_state.debug_logs = []
-    # 監控運行狀態
-    if "monitor_running" not in st.session_state:
-        st.session_state.monitor_running = False
-    # 下一次執行監控的時間（核心定時機制）
-    if "next_run_time" not in st.session_state:
-        st.session_state.next_run_time = None
-    # 原始數據緩存
     if "raw_token_data" not in st.session_state:
         st.session_state.raw_token_data = []
 
 init_session()
 config = st.session_state.config
 
-# ====================== 工具函數 ======================
+# ====================== 工具函數（線程安全） ======================
 def add_log(msg):
+    """新增日誌，線程安全"""
     st.session_state.debug_logs.insert(0, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs = st.session_state.debug_logs[:30]
@@ -81,7 +78,7 @@ def test_api_connection():
     except Exception as e:
         return False, f"❌ API連接失敗: {str(e)[:80]}"
 
-# ====================== 【核心】GeckoTerminal API（100%可訪問） ======================
+# ====================== 【核心】穩定API數據獲取 ======================
 def get_solana_tokens():
     headers = {
         "Accept": "application/json",
@@ -130,7 +127,7 @@ def get_solana_tokens():
         add_log(f"❌ API獲取失敗: {str(e)[:80]}")
         return []
 
-# ====================== 5個平台精準識別 ======================
+# ====================== 平台識別 ======================
 def parse_platform(pair):
     dex_id = pair.get("dexId", "").lower()
     token_name = pair.get("token_name", "").lower()
@@ -149,7 +146,7 @@ def parse_platform(pair):
             return "Zerg.zone"
     return None
 
-# ====================== 3個條件檢查（獨立勾選控制） ======================
+# ====================== 條件檢查 ======================
 def check_conditions(token_data):
     mint = token_data["mint"]
     market_cap = token_data["market_cap"]
@@ -157,7 +154,6 @@ def check_conditions(token_data):
     platform = token_data["platform"]
     pool_create_time = token_data["pool_create_time"]
 
-    # 記錄代幣首次發現時間
     if mint not in st.session_state.token_create_time:
         try:
             if pool_create_time:
@@ -171,22 +167,18 @@ def check_conditions(token_data):
     token_age_days = (datetime.now() - st.session_state.token_create_time[mint]).days
     trigger_reason = None
 
-    # 條件1檢查
     if config["cond1_enable"] and market_cap > 0:
         if market_cap <= config["cond1_max_mc"] and buy_1m >= config["cond1_min_buy"]:
             trigger_reason = f"條件1：市值(${market_cap:,.0f}) ≤ 設定上限 + 買入金額(${buy_1m:,.0f})達標"
 
-    # 條件2檢查
     if not trigger_reason and config["cond2_enable"]:
         if buy_1m >= config["cond2_min_buy_1m"]:
             trigger_reason = f"條件2：1分鐘買入暴量(${buy_1m:,.0f})"
 
-    # 條件3檢查
     if not trigger_reason and config["cond3_enable"]:
         if token_age_days >= config["cond3_min_days"] and buy_1m >= config["cond3_min_sudden_buy"]:
             trigger_reason = f"條件3：上線{token_age_days}天老幣 突發買入(${buy_1m:,.0f})"
 
-    # 觸發警報（5分鐘去重）
     if trigger_reason:
         alert = {
             "time": datetime.now().strftime("%m-%d %H:%M:%S"),
@@ -208,75 +200,115 @@ def check_conditions(token_data):
             if len(st.session_state.alerts) > 50:
                 st.session_state.alerts = st.session_state.alerts[:50]
 
-# ====================== 監控主邏輯 ======================
-def run_monitor():
-    pairs = get_solana_tokens()
-    if not pairs:
+# ====================== 【核心】後台監控線程主函數 ======================
+def monitor_worker():
+    """後台監控線程，不阻塞主頁面"""
+    add_log("✅ 監控線程已啟動，開始執行監控")
+    stop_event = st.session_state.stop_event
+    
+    while not stop_event.is_set():
+        try:
+            # 獲取數據
+            pairs = get_solana_tokens()
+            if pairs:
+                processed_count = 0
+                platform_match_count = 0
+
+                for pair in pairs:
+                    # 檢查是否需要停止
+                    if stop_event.is_set():
+                        break
+                    
+                    # 平台識別與過濾
+                    platform = parse_platform(pair)
+                    platform_key = platform.lower().replace(" ", "_").replace(".", "_").replace("/", "_") if platform else ""
+                    
+                    is_allowed = False
+                    if config["all_platform_enable"]:
+                        is_allowed = True
+                        platform = platform or "全平台"
+                    elif platform and platform_key in config["platforms"] and config["platforms"][platform_key]:
+                        is_allowed = True
+                        platform_match_count += 1
+                    
+                    if not is_allowed:
+                        continue
+
+                    # 提取數據
+                    base_token = pair.get("baseToken", {})
+                    mint = base_token.get("address")
+                    name = base_token.get("name", "未知代幣")
+                    symbol = base_token.get("symbol", "未知")
+                    market_cap = float(pair.get("marketCap", 0) or 0)
+                    volume_1m = float(pair.get("volume", {}).get("m1", 0) or 0)
+                    pool_create_time = pair.get("pool_created_at", "")
+
+                    if not mint or len(mint) != 44:
+                        continue
+
+                    # 檢查條件
+                    token_data = {
+                        "mint": mint,
+                        "name": name,
+                        "symbol": symbol,
+                        "market_cap": market_cap,
+                        "buy_1m": volume_1m,
+                        "platform": platform,
+                        "pool_create_time": pool_create_time
+                    }
+                    check_conditions(token_data)
+                    processed_count += 1
+
+                add_log(f"📊 本次掃描：符合平台規則 {platform_match_count} 個，實際處理 {processed_count} 個代幣")
+            
+            # 等待掃描間隔，期間檢查是否需要停止
+            wait_start = time.time()
+            while time.time() - wait_start < config["scan_interval"] and not stop_event.is_set():
+                time.sleep(0.5)
+        
+        except Exception as e:
+            add_log(f"❌ 監控線程異常: {str(e)[:80]}")
+            # 出錯也不停止線程，等待下次循環
+            time.sleep(5)
+    
+    add_log("⚠️ 監控線程已安全停止")
+
+# ====================== 啟動/停止按鈕回調函數 ======================
+def start_monitor():
+    """啟動監控按鈕回調"""
+    if st.session_state.monitor_running:
+        st.warning("監控已在運行中，無需重複啟動")
         return
+    
+    # 重置停止事件
+    st.session_state.stop_event.clear()
+    # 創建並啟動線程
+    st.session_state.monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
+    st.session_state.monitor_thread.start()
+    # 更新狀態
+    st.session_state.monitor_running = True
+    st.success("✅ 監控已成功啟動，後台正在執行掃描")
 
-    processed_count = 0
-    platform_match_count = 0
+def stop_monitor():
+    """停止監控按鈕回調"""
+    if not st.session_state.monitor_running:
+        st.warning("監控未在運行中")
+        return
+    
+    # 發送停止信號
+    st.session_state.stop_event.set()
+    # 等待線程停止
+    if st.session_state.monitor_thread:
+        st.session_state.monitor_thread.join(timeout=5)
+    # 更新狀態
+    st.session_state.monitor_running = False
+    st.warning("⚠️ 監控已成功停止")
 
-    for pair in pairs:
-        # 平台識別
-        platform = parse_platform(pair)
-        platform_key = platform.lower().replace(" ", "_").replace(".", "_").replace("/", "_") if platform else ""
-        
-        # 過濾規則
-        is_allowed = False
-        if config["all_platform_enable"]:
-            is_allowed = True
-            platform = platform or "全平台"
-        elif platform and platform_key in config["platforms"] and config["platforms"][platform_key]:
-            is_allowed = True
-            platform_match_count += 1
-        
-        if not is_allowed:
-            continue
-
-        # 提取核心數據
-        base_token = pair.get("baseToken", {})
-        mint = base_token.get("address")
-        name = base_token.get("name", "未知代幣")
-        symbol = base_token.get("symbol", "未知")
-        market_cap = float(pair.get("marketCap", 0) or 0)
-        volume_1m = float(pair.get("volume", {}).get("m1", 0) or 0)
-        pool_create_time = pair.get("pool_created_at", "")
-
-        if not mint or len(mint) != 44:
-            continue
-
-        # 檢查觸發條件
-        token_data = {
-            "mint": mint,
-            "name": name,
-            "symbol": symbol,
-            "market_cap": market_cap,
-            "buy_1m": volume_1m,
-            "platform": platform,
-            "pool_create_time": pool_create_time
-        }
-        check_conditions(token_data)
-        processed_count += 1
-
-    add_log(f"📊 本次掃描：符合平台規則 {platform_match_count} 個，實際處理 {processed_count} 個代幣")
-
-# ====================== 核心定時機制（零閃屏、不停止） ======================
-# 監控啟動狀態處理
+# ====================== 頁面自動刷新（實時顯示狀態，不阻塞） ======================
 if st.session_state.monitor_running:
-    # 首次啟動，設置第一次執行時間
-    if st.session_state.next_run_time is None:
-        st.session_state.next_run_time = datetime.now()
-    
-    # 檢查是否到了執行時間
-    if datetime.now() >= st.session_state.next_run_time:
-        run_monitor()
-        # 更新下一次執行時間
-        st.session_state.next_run_time = datetime.now() + timedelta(seconds=config["scan_interval"])
-    
-    # 非阻塞等待，然後軟重跑（瀏覽器不刷新，零閃屏）
-    time.sleep(1)
-    st.rerun()
+    st.markdown("""
+    <meta http-equiv="refresh" content="3">
+    """, unsafe_allow_html=True)
 
 # ====================== 高級介面樣式（手機自適應） ======================
 st.markdown("""
@@ -346,7 +378,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ====================== 頁面固定佈局（不閃爍） ======================
+# ====================== 頁面佈局 ======================
 st.title("🔥 SOL 多平台代幣實時監控系統")
 st.divider()
 
@@ -369,11 +401,10 @@ with col2:
     </div>
     """, unsafe_allow_html=True)
 with col3:
-    next_run_text = st.session_state.next_run_time.strftime("%H:%M:%S") if st.session_state.next_run_time else "未啟動"
     st.markdown(f"""
     <div class="metric-card">
-        <div style="font-size:14px;color:#9CA3AF;">下次掃描時間</div>
-        <div style="font-size:20px;font-weight:bold;color:#90CDF4;">{next_run_text}</div>
+        <div style="font-size:14px;color:#9CA3AF;">掃描間隔</div>
+        <div style="font-size:20px;font-weight:bold;color:#90CDF4;">{config['scan_interval']}秒</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -468,55 +499,39 @@ with st.expander("⚙️ 監控條件與平台設定", expanded=True):
 
 st.divider()
 
-# 啟動/停止按鈕
+# 啟動/停止按鈕（核心，點擊立刻觸發回調）
 col_start, col_stop = st.columns(2)
 with col_start:
-    if st.button("▶️ 啟動監控", type="primary", use_container_width=True):
-        if not st.session_state.monitor_running:
-            st.session_state.monitor_running = True
-            st.session_state.next_run_time = datetime.now()
-            st.success("✅ 監控已啟動，正在抓取數據...")
-            st.rerun()
+    st.button("▶️ 啟動監控", type="primary", use_container_width=True, on_click=start_monitor)
 with col_stop:
-    if st.button("⏹️ 停止監控", use_container_width=True):
-        if st.session_state.monitor_running:
-            st.session_state.monitor_running = False
-            st.session_state.next_run_time = None
-            st.warning("⚠️ 監控已停止")
-            st.rerun()
+    st.button("⏹️ 停止監控", use_container_width=True, on_click=stop_monitor)
 
 st.divider()
 
-# ====================== 動態內容區域（局部更新，不閃屏） ======================
-# 警報列表佔位符
-alert_placeholder = st.empty()
-# 除錯日誌佔位符
-log_placeholder = st.expander("🔍 除錯日誌與原始數據", expanded=False)
-
-# 更新動態內容
-with alert_placeholder.container():
-    st.subheader("📈 實時觸發警報")
-    if st.session_state.alerts:
-        for alert in st.session_state.alerts[:30]:
-            st.markdown(f"""
-            <div class="card">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
-                    <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
-                </div>
-                <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
-                <div style="display: flex; justify-content: space-between; margin: 8px 0;">
-                    <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
-                    <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
-                </div>
-                <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+# 警報列表
+st.subheader("📈 實時觸發警報")
+if st.session_state.alerts:
+    for alert in st.session_state.alerts[:30]:
+        st.markdown(f"""
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
+                <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
             </div>
-            """, unsafe_allow_html=True)
-            st.code(alert['mint'], language="text")
-    else:
-        st.info("如果啟動監控後沒有警報，請勾選「開啟全平台監控」，並適當調低觸發門檻")
+            <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
+            <div style="display: flex; justify-content: space-between; margin: 8px 0;">
+                <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
+                <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
+            </div>
+            <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.code(alert['mint'], language="text")
+else:
+    st.info("啟動監控後，數秒內即可抓取到代幣，符合條件將顯示在這裡")
 
-with log_placeholder.container():
+# 除錯日誌
+with st.expander("🔍 除錯日誌與原始數據", expanded=False):
     st.subheader("系統日誌")
     for log in st.session_state.debug_logs[:20]:
         st.text(log)
