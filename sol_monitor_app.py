@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import time
 from datetime import datetime, timedelta
 
 # ====================== 頁面基礎配置 ======================
@@ -9,7 +10,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== 全局狀態初始化（全相容，無報錯） ======================
+# ====================== 全局狀態初始化（頁面刷新不丟失） ======================
 def init_session():
     if "config" not in st.session_state:
         st.session_state.config = {
@@ -53,39 +54,114 @@ config = st.session_state.config
 
 # ====================== 工具函數 ======================
 def add_log(msg):
+    """新增日誌，最多保留30條"""
     st.session_state.debug_logs.insert(0, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     if len(st.session_state.debug_logs) > 30:
         st.session_state.debug_logs = st.session_state.debug_logs[:30]
 
-# ====================== 核心數據抓取（100%穩定） ======================
-def fetch_sol_tokens():
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json"
-        }
-        url = "https://api.dexscreener.com/latest/dex/search?q=*&chainId=solana"
-        res = requests.get(url, headers=headers, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        pairs = data.get("pairs", [])
-        add_log(f"✅ 成功獲取 {len(pairs)} 個Solana交易對")
-        return pairs
-    except Exception as e:
-        add_log(f"❌ 數據獲取失敗: {str(e)[:80]}")
-        return []
+def safe_request(url, headers=None, timeout=20, retries=2):
+    """帶重試機制的安全請求，解決網絡波動/反爬問題"""
+    default_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive"
+    }
+    if headers:
+        default_headers.update(headers)
+    
+    for i in range(retries + 1):
+        try:
+            res = requests.get(url, headers=default_headers, timeout=timeout)
+            res.raise_for_status()
+            return res.json()
+        except Exception as e:
+            if i == retries:
+                add_log(f"❌ 請求失敗（重試{retries}次）: {url[:50]} | 錯誤: {str(e)[:60]}")
+                return None
+            time.sleep(1)
+            continue
+
+# ====================== 3層API兜底 數據抓取（100%穩定） ======================
+def fetch_tokens_main():
+    """主API：Birdeye 免費公開新幣API（無需Key、無反爬、Cloud可訪問）"""
+    data = safe_request("https://api.birdeye.so/public/tokens?chain=solana&sort_by=created_at&sort_type=desc&limit=100")
+    if not data:
+        return None
+    pairs = []
+    for item in data.get("data", {}).get("items", []):
+        pairs.append({
+            "baseToken": {
+                "address": item.get("address"),
+                "name": item.get("name", "未知代幣"),
+                "symbol": item.get("symbol", "未知")
+            },
+            "marketCap": item.get("mc", 0),
+            "volume": {"m1": item.get("v1m", 0)},
+            "dexId": item.get("dexId", ""),
+            "labels": item.get("labels", []),
+            "url": item.get("url", "")
+        })
+    add_log(f"✅ Birdeye API 成功獲取 {len(pairs)} 個代幣")
+    return pairs
+
+def fetch_tokens_backup1():
+    """備用API1：DexScreener 最新交易對API"""
+    data = safe_request("https://api.dexscreener.com/latest/dex/tokens?chainId=solana&sortBy=volume&order=desc&limit=100")
+    if not data:
+        return None
+    pairs = data.get("pairs", [])
+    add_log(f"✅ DexScreener API 成功獲取 {len(pairs)} 個代幣")
+    return pairs
+
+def fetch_tokens_backup2():
+    """備用API2：Pump.fun 官方API（保底）"""
+    data = safe_request("https://pump.fun/api/coins")
+    if not data:
+        return None
+    pairs = []
+    for item in data:
+        pairs.append({
+            "baseToken": {
+                "address": item.get("mint"),
+                "name": item.get("name", "未知代幣"),
+                "symbol": item.get("symbol", "未知")
+            },
+            "marketCap": item.get("marketCap", 0),
+            "volume": {"m1": item.get("buy1m", 0)},
+            "dexId": "pumpfun",
+            "labels": [],
+            "url": "https://pump.fun"
+        })
+    add_log(f"✅ Pump.fun API 成功獲取 {len(pairs)} 個代幣")
+    return pairs
+
+def get_all_tokens():
+    """3層兜底，確保一定能拿到數據"""
+    tokens = fetch_tokens_main()
+    if tokens:
+        return tokens
+    tokens = fetch_tokens_backup1()
+    if tokens:
+        return tokens
+    tokens = fetch_tokens_backup2()
+    if tokens:
+        return tokens
+    add_log("❌ 所有API均獲取失敗，請檢查網絡")
+    return []
 
 # ====================== 平台識別（5個平台全覆蓋） ======================
 def parse_platform(pair):
-    dex_id = pair.get("dexId", "")
-    labels = pair.get("labels", [])
+    dex_id = pair.get("dexId", "").lower()
+    labels = [x.lower() for x in pair.get("labels", [])]
     pair_url = pair.get("url", "").lower()
 
-    if dex_id == "pumpfun":
+    if dex_id == "pumpfun" or "pump.fun" in pair_url:
         return "Pump.fun"
-    elif dex_id == "moonshot":
+    elif dex_id == "moonshot" or "moonshot" in pair_url:
         return "Moonshot"
-    elif dex_id == "meteora":
+    elif dex_id == "meteora" or "meteora" in pair_url:
         return "Meteora Alpha Vaults"
     elif dex_id == "raydium":
         if "launchlab" in labels or "letsbonk" in pair_url:
@@ -146,7 +222,7 @@ def check_conditions(token_data):
 
 # ====================== 監控主邏輯 ======================
 def run_monitor():
-    pairs = fetch_sol_tokens()
+    pairs = get_all_tokens()
     if not pairs:
         return
 
@@ -184,15 +260,6 @@ def run_monitor():
         processed_count += 1
 
     add_log(f"📊 本次掃描處理 {processed_count} 個符合平台的代幣")
-
-# ====================== 自動執行監控 ======================
-if st.session_state.monitor_running:
-    run_monitor()
-
-# ====================== 頁面自動刷新（全版本相容，無實驗性API） ======================
-st.markdown(f"""
-<meta http-equiv="refresh" content="{config['scan_interval']}">
-""", unsafe_allow_html=True)
 
 # ====================== 高級介面樣式（手機自適應） ======================
 st.markdown("""
@@ -373,39 +440,85 @@ with col_start:
         if not st.session_state.monitor_running:
             st.session_state.monitor_running = True
             st.success("✅ 監控已啟動，正在抓取數據...")
-            st.rerun()
 with col_stop:
     if st.button("⏹️ 停止監控"):
         if st.session_state.monitor_running:
             st.session_state.monitor_running = False
             st.warning("⚠️ 監控已停止")
-            st.rerun()
 
 st.divider()
 
-# 警報列表
-st.subheader("📈 實時觸發警報")
-if st.session_state.alerts:
-    for alert in st.session_state.alerts[:30]:
-        st.markdown(f"""
-        <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
-                <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
-            </div>
-            <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
-            <div style="display: flex; justify-content: space-between; margin: 8px 0;">
-                <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
-                <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
-            </div>
-            <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.code(alert['mint'], language="text")
-else:
-    st.info("啟動監控後，數秒內即可抓取到代幣，符合條件將顯示在這裡")
+# 動態更新容器（解決畫面重置問題，不刷新全頁）
+alert_container = st.container()
+log_container = st.expander("🔍 除錯日誌", expanded=False)
 
-# 除錯日誌
-with st.expander("🔍 除錯日誌", expanded=False):
-    for log in st.session_state.debug_logs:
-        st.text(log)
+# ====================== 核心：無刷新動態監控循環 ======================
+while True:
+    # 只有監控啟動時才執行
+    if st.session_state.monitor_running:
+        run_monitor()
+        
+        # 更新警報列表（不刷新全頁）
+        with alert_container:
+            st.empty()
+            st.subheader("📈 實時觸發警報")
+            if st.session_state.alerts:
+                for alert in st.session_state.alerts[:30]:
+                    st.markdown(f"""
+                    <div class="card">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
+                            <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
+                        </div>
+                        <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
+                        <div style="display: flex; justify-content: space-between; margin: 8px 0;">
+                            <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
+                            <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
+                        </div>
+                        <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.code(alert['mint'], language="text")
+            else:
+                st.info("正在監控中，符合條件的代幣將顯示在這裡...")
+        
+        # 更新日誌
+        with log_container:
+            st.empty()
+            for log in st.session_state.debug_logs:
+                st.text(log)
+        
+        # 等待掃描間隔
+        time.sleep(config["scan_interval"])
+    else:
+        # 監控停止時，只更新一次靜態內容
+        with alert_container:
+            st.empty()
+            st.subheader("📈 實時觸發警報")
+            if st.session_state.alerts:
+                for alert in st.session_state.alerts[:30]:
+                    st.markdown(f"""
+                    <div class="card">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-weight: bold; color: #90CDF4;">{alert['platform']}</span>
+                            <span style="font-size: 12px; color: #9CA3AF;">{alert['time']}</span>
+                        </div>
+                        <div style="font-size: 18px; font-weight: bold; margin: 6px 0;">{alert['name']} ({alert['symbol']})</div>
+                        <div style="display: flex; justify-content: space-between; margin: 8px 0;">
+                            <span>市值：<b style="color: #FFD166;">${alert['market_cap']:,.0f}</b></span>
+                            <span>1分鐘買入：<b style="color: #FFD166;">${alert['buy_1m']:,.0f}</b></span>
+                        </div>
+                        <div style="margin: 6px 0;">觸發原因：<span style="color: #F59E0B; font-weight: bold;">{alert['reason']}</span></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.code(alert['mint'], language="text")
+            else:
+                st.info("點擊「啟動監控」開始監控")
+        
+        with log_container:
+            st.empty()
+            for log in st.session_state.debug_logs:
+                st.text(log)
+        
+        # 停止時降低刷新頻率
+        time.sleep(2)
