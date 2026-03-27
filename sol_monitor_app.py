@@ -1,131 +1,226 @@
-import streamlit as st
-import pandas as pd
 import time
-import random
+import json
+import sqlite3
+import threading
 from datetime import datetime
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import requests
 
-st.set_page_config(page_title="SOL監測", layout="wide", initial_sidebar_state="collapsed")
+app = FastAPI()
 
-st.title("🚀 SOL 鏈幣即時監測 App")
-st.caption("5 大平台 • 3 項條件 • 真實 CA • 長按複製 • 手機專用")
+# ====================== 配置 ======================
+CONFIG = {
+    "MAX_MARKET_CAP": 50000,
+    "CONDITION_1_MIN_BUY": 800,
+    "CONDITION_2_MIN_BUY_1MIN": 1500,
+    "CONDITION_3_OLD_TOKEN_DAYS": 7,
+    "CONDITION_3_SUDDEN_BUY": 3000,
+    "SCAN_INTERVAL": 60,
+}
 
-# ====================== 警告說明 ======================
-st.warning("⚠️ 目前仍是模擬監測（買入數據為測試），但 CA 已改成真實存在的 Solana 幣。你複製後可在 Solscan / Birdeye 找到真實幣。想接真實即時數據（Pump.fun/Moonshot）請告訴我！")
+ALERTS = []
 
-# ====================== 主畫面條件設定 ======================
-st.subheader("⚙️ 條件設定（直接在這裡手動修改）")
-with st.expander("🔧 展開調整 3 項條件", expanded=True):
-    col_set1, col_set2 = st.columns(2)
-    with col_set1:
-        mcap_threshold = st.number_input("1. 市值低於 (USD)", value=50000, step=1000)
-        buy_amount1 = st.number_input("   買入金額 (SOL)", value=10.0, step=1.0)
-    with col_set2:
-        minute_buy_threshold = st.number_input("2. 每分鐘買入 (SOL)", value=50.0, step=5.0)
-    
-    col_set3, col_set4 = st.columns(2)
-    with col_set3:
-        age_threshold_days = st.number_input("3. 幣齡超過 (天)", value=7, step=1)
-    with col_set4:
-        sudden_buy_amount = st.number_input("   突然大買 (SOL)", value=30.0, step=5.0)
+# ====================== 数据库 ======================
+def init_db():
+    conn = sqlite3.connect("tokens.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS tokens
+                 (address TEXT PRIMARY KEY, platform TEXT, created_at TIMESTAMP)''')
+    conn.commit()
+    conn.close()
 
-# ====================== 目前條件值 ======================
-st.subheader("📊 目前條件設定值")
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("條件1", f"${mcap_threshold:,} + {buy_amount1} SOL")
-with col2:
-    st.metric("條件2", f"{minute_buy_threshold} SOL/分鐘")
-with col3:
-    st.metric("條件3", f"{age_threshold_days} 天 + {sudden_buy_amount} SOL")
+def save_token(address, platform):
+    try:
+        conn = sqlite3.connect("tokens.db")
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO tokens VALUES (?, ?, ?)",
+                  (address, platform, datetime.now()))
+        conn.commit()
+        conn.close()
+    except:
+        pass
 
-# ====================== 監測平台 ======================
-with st.sidebar:
-    st.header("監測平台")
-    platforms = ["Pump.fun", "Moonshot", "LaunchLab / LetsBONK.fun", "Meteora / Alpha Vaults", "Zerg.zone"]
-    selected = st.multiselect("選擇平台", platforms, default=platforms)
+def get_token_days(address):
+    try:
+        conn = sqlite3.connect("tokens.db")
+        c = conn.cursor()
+        c.execute("SELECT created_at FROM tokens WHERE address=?", (address,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return 0
+        delta = datetime.now() - datetime.fromisoformat(row[0])
+        return delta.days
+    except:
+        return 0
 
-# ====================== 真實 CA 資料庫（已修正） ======================
-REAL_CAS = [
-    "SoLeKPdJ5GjUtvFAeNtefpKhRj42vjoZWmrvLmSWnmS",   # Pump.fun 真實幣
-    "Ek3ts4r6kGC7VmFBVimFEz7CqyRZGpxcbwXs57YDYLoH",   # Pump.fun 真實幣
-    "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",    # $PUMP 官方
-    "7MUp1jJd25RTqUatDep55qMbVSNpLfn8qLKXv9Rbpump",   # meme coin 真實
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC (測試用)
-]
+# ====================== 平台抓取 ======================
+def fetch_pump_fun():
+    try:
+        res = requests.get("https://pump.fun/api/coins", timeout=10)
+        data = res.json()
+        return [{
+            "mint": x["mint"],
+            "market_cap": float(x.get("marketCap", 0)),
+            "buy_1min": float(x.get("buy1m", 0)),
+            "platform": "Pump.fun"
+        } for x in data if x.get("mint")]
+    except:
+        return []
 
-if "alerts" not in st.session_state:
-    st.session_state.alerts = []
-if "tokens" not in st.session_state:
-    st.session_state.tokens = []
+def fetch_moonshot():
+    try:
+        res = requests.get("https://api.moonshot.so/api/v1/tokens", timeout=10)
+        data = res.json()
+        return [{
+            "mint": x["mint"],
+            "market_cap": float(x.get("marketCap", 0)),
+            "buy_1min": float(x.get("volume1m", 0)),
+            "platform": "Moonshot"
+        } for x in data.get("tokens", []) if x.get("mint")]
+    except:
+        return []
 
-def generate_mock_token():
-    platform = random.choice(selected)
-    ca = random.choice(REAL_CAS)          # ← 改用真實 CA
-    return {
-        "時間": datetime.now().strftime("%H:%M:%S"),
-        "平台": platform,
-        "幣種": f"${random.choice(['PEPE','DOGE','BONK','MOON','ZERG','PUMP'])}{random.randint(100,999)}",
-        "CA": ca,
-        "市值": random.randint(8000, 150000),
-        "幣齡(天)": random.randint(0, 30),
-        "單筆買入(SOL)": round(random.uniform(5, 120), 1),
-        "1分鐘買入(SOL)": round(random.uniform(10, 200), 1),
-    }
+def fetch_launchlab():
+    try:
+        res = requests.get("https://letsbonk.fun/api/new", timeout=10)
+        data = res.json()
+        return [{
+            "mint": x["mint"],
+            "market_cap": float(x.get("marketCap", 0)),
+            "buy_1min": float(x.get("buy1m", 0)),
+            "platform": "LaunchLab"
+        } for x in data if x.get("mint")]
+    except:
+        return []
 
-# ====================== 實時監測 ======================
-st.header("📡 實時監測中")
-col_start, col_stop = st.columns([3,1])
-if col_start.button("🔄 開始監測（每5秒更新）", type="primary", use_container_width=True):
-    st.session_state.monitoring = True
-if col_stop.button("⏹️ 停止", use_container_width=True):
-    st.session_state.monitoring = False
+def fetch_meteora():
+    try:
+        res = requests.get("https://api.meteora.ag/clusters/mainnet/alpha-vaults", timeout=10)
+        data = res.json()
+        return [{
+            "mint": x["tokenMint"],
+            "market_cap": float(x.get("marketCap", 0)),
+            "buy_1min": float(x.get("buyVolume1m", 0)),
+            "platform": "Meteora"
+        } for x in data if x.get("tokenMint")]
+    except:
+        return []
 
-token_placeholder = st.empty()
-alert_placeholder = st.empty()
+def fetch_zerg():
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://zerg.zone/api/v1/new-tokens", headers=headers, timeout=10)
+        data = res.json()
+        return [{
+            "mint": x["mint"],
+            "market_cap": float(x.get("marketCap", 0)),
+            "buy_1min": float(x.get("buy1m", 0)),
+            "platform": "Zerg.zone"
+        } for x in data.get("data", []) if x.get("mint")]
+    except:
+        return []
 
-if st.session_state.get("monitoring", False):
-    for _ in range(50):
-        token = generate_mock_token()
-        st.session_state.tokens.append(token)
-        
-        # 條件判斷（同之前）
-        if token["市值"] < mcap_threshold and token["單筆買入(SOL)"] >= buy_amount1:
-            alert_text = f"🚨條件1 | {token['平台']} | {token['幣種']} | 市值${token['市值']:,} | 買入{token['單筆買入(SOL)']}SOL"
-            st.session_state.alerts.append({"時間": token["時間"], "警報": alert_text, "CA": token["CA"]})
-        if token["1分鐘買入(SOL)"] >= minute_buy_threshold:
-            alert_text = f"🚨條件2 | {token['平台']} | {token['幣種']} | 1分鐘{token['1分鐘買入(SOL)']}SOL"
-            st.session_state.alerts.append({"時間": token["時間"], "警報": alert_text, "CA": token["CA"]})
-        if token["幣齡(天)"] > age_threshold_days and token["單筆買入(SOL)"] >= sudden_buy_amount:
-            alert_text = f"🚨條件3 | {token['平台']} | {token['幣種']} | 老幣{token['幣齡(天)']}天 | 突買{token['單筆買入(SOL)']}SOL"
-            st.session_state.alerts.append({"時間": token["時間"], "警報": alert_text, "CA": token["CA"]})
-        
-        # 顯示 Token 列表
-        df = pd.DataFrame(st.session_state.tokens[-8:])
-        token_placeholder.dataframe(df[["時間", "平台", "幣種", "CA", "市值", "幣齡(天)", "單筆買入(SOL)"]], use_container_width=True, hide_index=True)
-        
-        # 警報區（長按複製 CA）
-        with alert_placeholder.container():
-            st.subheader("🚨 最新警報")
-            for alert in reversed(st.session_state.alerts[-8:]):
-                st.markdown(f"**{alert['時間']}** | {alert['警報']}")
-                st.code(alert["CA"], language=None)   # ← 長按即可複製
-                st.caption("📱 長按上方 CA 文字 → 複製")
-                st.markdown(f"[🔍 查看 Solscan](https://solscan.io/token/{alert['CA']})")
-                st.divider()
-        
-        time.sleep(5)
+ALL_FETCHERS = [fetch_pump_fun, fetch_moonshot, fetch_launchlab, fetch_meteora, fetch_zerg]
 
-# ====================== 歷史警報 ======================
-st.header("📜 歷史警報紀錄")
-if st.session_state.alerts:
-    for alert in reversed(st.session_state.alerts):
-        st.markdown(f"**{alert['時間']}** | {alert['警報']}")
-        st.code(alert["CA"], language=None)
-        st.caption("📱 長按 CA 文字即可複製")
-        st.markdown(f"[🔍 查看 Solscan](https://solscan.io/token/{alert['CA']})")
-        st.divider()
-else:
-    st.info("尚未觸發警報")
+# ====================== 条件判断 ======================
+def check_token(token):
+    mc = token["market_cap"]
+    buy = token["buy_1min"]
+    mint = token["mint"]
+    platform = token["platform"]
+    days = get_token_days(mint)
+    save_token(mint, platform)
 
-st.success("✅ 已修正！CA 現在是真實幣，複製方式改成長按即可")
-st.caption("測試完告訴我是否要升級成「真實即時數據」（Pump.fun/Moonshot 真實買入）")
+    reason = None
+
+    if mc <= CONFIG["MAX_MARKET_CAP"] and buy >= CONFIG["CONDITION_1_MIN_BUY"]:
+        reason = "低市值 + 买入达标"
+
+    elif buy >= CONFIG["CONDITION_2_MIN_BUY_1MIN"]:
+        reason = "1分钟买入暴量"
+
+    elif days >= CONFIG["CONDITION_3_OLD_TOKEN_DAYS"] and buy >= CONFIG["CONDITION_3_SUDDEN_BUY"]:
+        reason = f"老币{days}天 突然大额买入"
+
+    if reason:
+        alert = {
+            "time": datetime.now().strftime("%m-%d %H:%M:%S"),
+            "platform": platform,
+            "mint": mint,
+            "mc": round(mc, 2),
+            "buy1m": round(buy, 2),
+            "reason": reason
+        }
+        ALERTS.insert(0, alert)
+        if len(ALERTS) > 100:
+            del ALERTS[100:]
+
+# ====================== 监控线程 ======================
+def monitor_thread():
+    init_db()
+    while True:
+        for f in ALL_FETCHERS:
+            try:
+                tokens = f()
+                for t in tokens:
+                    check_token(t)
+            except:
+                pass
+        time.sleep(CONFIG["SCAN_INTERVAL"])
+
+# ====================== 手机自适应网页界面 ======================
+@app.get("/", response_class=HTMLResponse)
+def home():
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SOL 监测</title>
+        <style>
+            * {{ margin:0; padding:0; box-sizing:border-box; font-family:system-ui; }}
+            body {{ background:#0b0f1a; color:#eaecef; padding:12px; }}
+            .title {{ text-align:center; font-size:22px; margin-bottom:12px; color:#ffdd57; }}
+            .config {{ background:#121a29; padding:10px; border-radius:12px; margin-bottom:12px; font-size:14px; }}
+            .alert {{ background:#151c30; padding:10px; border-radius:10px; margin-bottom:8px;
+                      border-left:3px solid #ffdd57; font-size:14px; }}
+            .platform {{ color:#7ccfff; font-weight:bold; }}
+            .reason {{ color:#ff7070; margin-top:4px; }}
+            .mint {{ color:#aaa; word-break:break-all; font-size:12px; margin-top:4px; }}
+        </style>
+    </head>
+    <body>
+        <div class="title">SOL 多平台代币监测</div>
+
+        <div class="config">
+            市值上限: ${CONFIG['MAX_MARKET_CAP']}<br>
+            1分钟买入: ≥${CONFIG['CONDITION_2_MIN_BUY_1MIN']}<br>
+            老币天数: {CONFIG['CONDITION_3_OLD_TOKEN_DAYS']}天
+        </div>
+    """
+
+    for a in ALERTS[:30]:
+        html += f'''
+        <div class="alert">
+            <div class="platform">{a['platform']}</div>
+            <div>市值: ${a['mc']}　买入1m: ${a['buy1m']}</div>
+            <div class="reason">{a['reason']}</div>
+            <div class="mint">{a['mint']}</div>
+            <div style="font-size:11px;color:#888;margin-top:4px;">{a['time']}</div>
+        </div>
+        '''
+
+    html += """
+    </body>
+    </html>
+    """
+    return html
+
+# ====================== 启动 ======================
+if __name__ == "__main__":
+    threading.Thread(target=monitor_thread, daemon=True).start()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
